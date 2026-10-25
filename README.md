@@ -1,204 +1,160 @@
 # ============================================================================
-# BLOK 10 — v2 TASARIMI
+# BLOK 11 — SAMPIYON DOGRULAMA VE NIHAI KARAR
 #
-# BLOK 9 BULGULARI:
-#   1. Donusum orani k = HEDEF/oncul COKTU:  60_3 %33, 30_2 %12, 60_6 %12
-#      AMA 20_2'ninki DEGISMEDI (OOT/TRAIN=0.999, p=0.858)
-#   2. Dusus TRAIN->ARA arasinda; ARA->OOT'de k stabil (OOT/ARA ~ 1.00)
-#   3. Recursive duzeltme sadece buyuk bilgi_ay'da calisiyor (CHAMPION +0.122)
-#   4. Oransal hedef, k'si degisen onculde kazandiriyor (+1.44, +1.80)
+# DURUM: CHAMPION v2c skill +0.265 ile esigi gecti. AMA:
+#   - 12 gozlem uzerinde olculdu
+#   - Bu OOT v1'de harcandi
+#   - ULTRA_ERKEN v2b Pearson -0.089 (WMAPE yaniltici)
 #
-# v2'NIN UC DEGISIKLIGI:
-#   A. K-STABILITE KRITERI  : feature secimine yeni filtre
-#   B. KISA EGITIM PENCERESI: eski rejimi unut (k dusus TRAIN'de kaldi)
-#   C. KOSULLU DUZELTME     : sadece bilgi_ay >= 4 oldugunda recursive duzeltme
-#
-# !!! DURUSTLUK NOTU: Bu OOT (202410-202509) artik HARCANDI. Asagidaki
-#     sonuclar KESIF niteliginde, bagimsiz dogrulama DEGIL.
-#     v2'nin gercek testi 202510+ kohortlari olgunlastiginda yapilmalidir.
+# BU BLOK:
+#   11.1  WMAPE + PEARSON birlikte -> dogru secim (WMAPE tek basina yetmez)
+#   11.2  CHAMPION v2c donem bazinda detay
+#   11.3  BOOTSTRAP: skill +0.265'in guven araligi
+#   11.4  DIEBOLD-MARIANO: Dummy'den farki istatistiksel olarak anlamli mi?
+#   11.5  Nihai karar ve uretim cercevesi
 # ============================================================================
 print("=" * 110)
-print("BLOK 10 — v2 TASARIMI")
+print("BLOK 11 — SAMPIYON DOGRULAMA")
 print("=" * 110)
-print("""
-  !!! UYARI: OOT (202410-202509) v1'de kullanildi ve HARCANDI.
-      Buradaki sonuclar KESIF amaclidir, bagimsiz dogrulama degildir.
-      v2'nin gercek sinavi: 202510+ kohortlari olgunlastiginda.
-""")
 
-# ---------------------------------------------------------------- 10.A
-print("-" * 110)
-print("10.A  K-STABILITE SKORU — her oncul icin donusum orani ne kadar sabit?")
-print("-" * 110)
-print("""
-  Mevcut secim kriteri: r2 + VIF + kayma (z, disari)
-  EKSIK OLAN: oncul ile hedef arasindaki ORANIN zaman icinde sabitligi.
-
-  k_t = HEDEF_t / oncul_t
-  Olculer:
-    k_CV      : k'nin degisim katsayisi (dusuk = sabit)
-    k_TREND_p : k'de dogrusal trend var mi (p>0.05 istiyoruz)
-    k_SON_ORAN: son 12 kohortun k ortalamasi / ilk 12'nin  (1'e yakin istiyoruz)
-""")
-olg = d[d.HEDEF_KULLANILABILIR].copy().sort_values("AY").reset_index(drop=True)
-kst = []
-for c in CHAMPION_BUDANMIS:
-    s = olg[[c, HEDEF]].dropna()
-    s = s[s[c] > 0]
-    if len(s) < 25: continue
-    k = (s[HEDEF]/s[c]).values
-    t = np.arange(len(k))
-    sl, ic, r_, p_, se = stats.linregress(t, k)
-    n2 = max(8, len(k)//3)
-    kst.append({"oncul": c.replace("KK_TAKIP_","").replace(f"_{T}",""),
-                "tam_ad": c, "n": len(k),
-                "k_ort": k.mean(), "k_CV": 100*k.std()/k.mean(),
-                "k_trend_p": p_, "k_trend_R2": r_**2,
-                "k_son/ilk": k[-n2:].mean()/k[:n2].mean(),
-                "r2_hedef": float(tek.set_index("degisken").r2.get(c, np.nan))})
-KST = pd.DataFrame(kst)
-# K-STABILITE SKORU: dusuk CV + trendsiz + son/ilk 1'e yakin
-KST["K_SKOR"] = (KST.k_CV.rank(pct=True)*0.40
-                 + (1-KST.k_trend_p).rank(pct=True)*0.30
-                 + (KST["k_son/ilk"]-1).abs().rank(pct=True)*0.30)
-KST = KST.sort_values("K_SKOR")
-print(KST.drop(columns=["tam_ad"]).round(4).to_string(index=False))
-print("""
-  K_SKOR dusuk = donusum orani STABIL = uretimde guvenilir
-  >> r2_hedef yuksek ama K_SKOR kotu olan onculler v1'in tuzagidir:
-     gecmisi iyi aciklar, gelecegi sisirir.
-""")
-
-# ---------------------------------------------------------------- 10.B
-print("-" * 110)
-print("10.B  v2 HAVUZU — r2 VE k-stabilite birlikte")
-print("-" * 110)
-KST["r2_rank"] = KST.r2_hedef.rank(pct=True, ascending=False)
-KST["BIRLESIK_SKOR"] = 0.45*KST.r2_rank + 0.55*KST.K_SKOR
-V2 = KST.sort_values("BIRLESIK_SKOR")
-print(V2[["oncul","r2_hedef","k_CV","k_trend_p","k_son/ilk","K_SKOR","BIRLESIK_SKOR"]]
-        .head(14).round(4).to_string(index=False))
-V2_HAVUZ = V2.head(10).tam_ad.tolist() + \
-           [c for c in ["MM_SKOR","KKB_MERKEZ"] if c in d.columns]
-print(f"\n  v2 havuzu ({len(V2_HAVUZ)}): "
-      f"{[c.replace('KK_TAKIP_','').replace(f'_{T}','') for c in V2_HAVUZ]}")
-_atilan = set(CHAMPION_BUDANMIS) - set(V2_HAVUZ)
-print(f"  v1'de olup v2'de ELENEN: "
-      f"{[c.replace('KK_TAKIP_','').replace(f'_{T}','') for c in sorted(_atilan)]}")
-
-# ---------------------------------------------------------------- 10.C
+# ---------------------------------------------------------------- 11.1
 print("\n" + "-" * 110)
-print("10.C  KISA EGITIM PENCERESI — eski rejimi unut")
+print("11.1  DOGRU SECIM: WMAPE + PEARSON birlikte")
 print("-" * 110)
 print("""
-  BLOK 9.1: k dususu TRAIN icinde oldu, ARA->OOT'de k STABIL.
-  Yani son ~24 kohort ayni rejimde. Tum gecmisi egitime katmak
-  modeli ESKI (yuksek k) rejime cekiyor.
+  10.D'deki ozet tablo WMAPE.idxmin() ile secim yapti -> YANLIS.
+  ULTRA_ERKEN v2b: WMAPE 13.33 (iyi) ama PEARSON -0.089 (model bilgi tasimiyor).
+  Dusuk WMAPE, "duz cizgi tahmin et" stratejisiyle de elde edilebilir.
 
-  TEST: egitim setini son N kohortla sinirla.
+  DOGRU KRITER: PEARSON > 0.30 SARTI + sonra WMAPE minimum
 """)
-def wf_pencereli(kolonlar, aile, bilgi_ay, hedef_idx, max_gecmis=None,
-                 ek_kolonlar=None, yarilanma=1.0, oran_paydasi=None,
-                 duzelt_pencere=None):
-    kol = list(kolonlar) + list(ek_kolonlar or [])
-    olgun = d[d.HEDEF_KULLANILABILIR]
-    tah, ger, don = [], [], []
-    for i in hedef_idx:
-        c = d.loc[i]; tahmin_ay = c["AY"] + bilgi_ay
-        eg = olgun[olgun["HEDEF_ERISIM"] < tahmin_ay]
-        if max_gecmis: eg = eg.tail(max_gecmis)
-        kk = kol + ([oran_paydasi] if oran_paydasi and oran_paydasi not in kol else [])
-        eg = eg[kk + [HEDEF]].dropna()
-        if oran_paydasi: eg = eg[eg[oran_paydasi] > 0]
-        if len(eg) < MIN_TRAIN: continue
-        x = d.loc[[i], kk]
-        if x.isna().any(axis=None): continue
-        if oran_paydasi and float(x[oran_paydasi].iloc[0]) <= 0: continue
-        pipe = pipeline_kur(aile)
-        _e = CONFIG.get("ZAMAN_YARILANMA",1.0); CONFIG["ZAMAN_YARILANMA"] = yarilanma
-        y_fit = (eg[HEDEF]/eg[oran_paydasi]) if oran_paydasi else eg[HEDEF]
-        _fit_agirlikli(pipe, eg[kol], y_fit, _agirlik(eg.index), aile)
-        CONFIG["ZAMAN_YARILANMA"] = _e
-        p = float(pipe.predict(x[kol])[0])
-        if oran_paydasi: p *= float(x[oran_paydasi].iloc[0])
-        if duzelt_pencere:
-            gec = eg.tail(duzelt_pencere)
-            if len(gec) >= 3:
-                pg = pipe.predict(gec[kol])
-                if oran_paydasi: pg = pg*gec[oran_paydasi].values
-                p -= float(np.mean(pg - gec[HEDEF].values))
-        tah.append(float(np.clip(p,0,1))); ger.append(float(c[HEDEF])); don.append(c[DONEM_KOL])
-    if not tah: return None
-    y,p = np.array(ger), np.array(tah); e = p-y
-    m = temel_metrikler(y,p)
-    return {"WMAPE":m["WMAPE"],"MAE":m["MAE"],"SAPMA":m["SAPMA"],
-            "POZ":int((e>0).sum()),"N":len(y),
-            "PEARSON":float(stats.pearsonr(y,p)[0]) if len(y)>3 else np.nan,
-            "_don":don,"_ger":ger,"_tah":tah}
+V2S2 = V2S.copy()
+V2S2["GECERLI"] = V2S2.PEARSON > 0.30
+dogru = []
+for ad in V2S2.MERDIVEN.unique():
+    s = V2S2[(V2S2.MERDIVEN == ad) & V2S2.GECERLI]
+    if len(s) == 0:
+        s = V2S2[V2S2.MERDIVEN == ad]
+        print(f"  !! [{ad}] hicbir senaryo PEARSON>0.30 saglamiyor")
+    b = s.loc[s.WMAPE.idxmin()]
+    dogru.append(b)
+DOGRU = pd.DataFrame(dogru)
+DOGRU["erkenlik"] = DOGRU.MERDIVEN.map(
+    {k: CONFIG["HEDEF_OLGUNLASMA_AY"]-v["bilgi_ay"] for k, v in SECILEN.items()})
+print("\n  PEARSON>0.30 sartiyla DOGRU secim:")
+print(DOGRU[["MERDIVEN","erkenlik","senaryo","WMAPE","SAPMA","POZ","PEARSON","skill"]]
+        .sort_values("erkenlik", ascending=False).round(4).to_string(index=False))
+print(f"\n  Karsilastirma — 10.D'nin (hatali) secimi:")
+print(best[["MERDIVEN","senaryo","WMAPE","PEARSON","skill"]].round(4).to_string(index=False))
 
-_dref = walkforward([CHALLENGER_BUDANMIS[0]], "Dummy", 3, oot_idx)
-DUMMY_W = _dref["WMAPE"]
-print(f"  Referans Dummy WMAPE = {DUMMY_W:.3f}\n")
-pen = []
-for ad, s in SECILEN.items():
-    for mg in [None, 36, 30, 24, 18]:
-        r = wf_pencereli(s["kolonlar"], s["aile"], s["bilgi_ay"], oot_idx,
-                         max_gecmis=mg, ek_kolonlar=s["ek"], yarilanma=s["yarilanma"])
-        if r: pen.append({"MERDIVEN":ad,"egitim_penceresi":mg or "TUMU",
-                          "WMAPE":r["WMAPE"],"SAPMA":r["SAPMA"],
-                          "POZ":f"{r['POZ']}/{r['N']}","skill":1-r["WMAPE"]/DUMMY_W})
-PEN = pd.DataFrame(pen)
-for ad in PEN.MERDIVEN.unique():
-    print(f"\n  [{ad}]")
-    print(PEN[PEN.MERDIVEN==ad].round(4).to_string(index=False))
+# ---------------------------------------------------------------- 11.2
+print("\n" + "-" * 110)
+print("11.2  CHAMPION v2c — DONEM BAZINDA")
+print("-" * 110)
+s = SECILEN["CHAMPION"]
+payda = [c for c in V2_HAVUZ if GEREKEN_AY.get(c, 99) <= s["bilgi_ay"]
+         and (c.startswith("KK_TAKIP_") or c.startswith("RR_"))][0]
+print(f"  Oransal payda : {payda.replace('KK_TAKIP_','').replace(f'_{T}','')}")
+print(f"  Egitim penceresi: son 30 kohort  |  Duzeltme penceresi: 6 kohort")
+print(f"  Girdiler: {[c.replace('KK_TAKIP_','').replace(f'_{T}','') for c in s['kolonlar']+s['ek']]}\n")
 
-# ---------------------------------------------------------------- 10.D
+r_v2c = wf_pencereli(s["kolonlar"], s["aile"], s["bilgi_ay"], oot_idx,
+                     max_gecmis=30, ek_kolonlar=s["ek"], yarilanma=s["yarilanma"],
+                     oran_paydasi=payda, duzelt_pencere=6)
+r_v1  = walkforward(s["kolonlar"], s["aile"], s["bilgi_ay"], oot_idx,
+                    s["yarilanma"], s["ek"])
+r_dum = walkforward([CHALLENGER_BUDANMIS[0]], "Dummy", 3, oot_idx)
+
+DET = pd.DataFrame({"DONEM": r_v2c["_don"],
+                    "GERCEK_%": [100*x for x in r_v2c["_ger"]],
+                    "v2c_%":    [100*x for x in r_v2c["_tah"]],
+                    "v1_%":     [100*x for x in r_v1["_tah"]],
+                    "Dummy_%":  [100*x for x in r_dum["_tah"]]})
+for k in ["v2c","v1","Dummy"]:
+    DET[f"{k}_sapma"] = DET[f"{k}_%"] - DET["GERCEK_%"]
+print(DET.round(3).to_string(index=False))
+print(f"\n  v2c   : WMAPE={r_v2c['WMAPE']:.3f}  sapma={r_v2c['SAPMA']:+.5f}  "
+      f"poz={r_v2c['POZ']}/{r_v2c['N']}  Pearson={r_v2c['PEARSON']:.4f}")
+print(f"  v1    : WMAPE={r_v1['WMAPE']:.3f}  sapma={r_v1['SAPMA']:+.5f}  "
+      f"poz={r_v1['POZ_SAPMA']}/{r_v1['N']}")
+print(f"  Dummy : WMAPE={r_dum['WMAPE']:.3f}  sapma={r_dum['SAPMA']:+.5f}  "
+      f"poz={r_dum['POZ_SAPMA']}/{r_dum['N']}")
+
+# ---------------------------------------------------------------- 11.3
+print("\n" + "-" * 110)
+print("11.3  BOOTSTRAP — skill +0.265'in guven araligi (12 gozlem!)")
+print("-" * 110)
+rng = np.random.default_rng(42)
+y  = np.array(r_v2c["_ger"]); p2 = np.array(r_v2c["_tah"])
+p1 = np.array(r_v1["_tah"]);  pd_= np.array(r_dum["_tah"])
+B = 5000; sk, dm_fark = np.empty(B), np.empty(B)
+for i in range(B):
+    ix = rng.integers(0, len(y), len(y))
+    w2 = 100*np.sum(np.abs(p2[ix]-y[ix]))/np.sum(np.abs(y[ix]))
+    wd = 100*np.sum(np.abs(pd_[ix]-y[ix]))/np.sum(np.abs(y[ix]))
+    sk[i] = 1 - w2/wd
+    dm_fark[i] = wd - w2
+print(f"  skill ortalama        : {sk.mean():+.4f}")
+print(f"  %90 guven araligi     : [{np.percentile(sk,5):+.4f}, {np.percentile(sk,95):+.4f}]")
+print(f"  %95 guven araligi     : [{np.percentile(sk,2.5):+.4f}, {np.percentile(sk,97.5):+.4f}]")
+print(f"  P(skill > 0)          : {100*(sk>0).mean():.1f}%")
+print(f"  P(skill > 0.15)       : {100*(sk>0.15).mean():.1f}%")
+print(f"\n  >> %90 alt sinir > 0 ise, Dummy'den ustunluk 12 gozlemde bile saglam.")
+print(f"  >> Alt sinir negatifse, +0.265 SANS olabilir — yeni OOT sart.")
+
+# ---------------------------------------------------------------- 11.4
+print("\n" + "-" * 110)
+print("11.4  DIEBOLD-MARIANO — v2c vs Dummy, v2c vs v1")
+print("-" * 110)
+def dm_testi(y, pa, pb, ad_a, ad_b):
+    """H0: iki tahminin dogrulugu esit. Kayip farki uzerinde t-testi."""
+    la = np.abs(pa-y); lb = np.abs(pb-y)
+    dfark = la - lb
+    n = len(dfark); ort = dfark.mean()
+    # HAC varyans (Newey-West, lag=1) — kucuk orneklem icin
+    g0 = np.mean((dfark-ort)**2)
+    g1 = np.mean((dfark[1:]-ort)*(dfark[:-1]-ort)) if n > 2 else 0.0
+    var = (g0 + 2*g1)/n
+    dm = ort/np.sqrt(var) if var > 0 else np.nan
+    p = 2*(1-stats.t.cdf(abs(dm), n-1)) if np.isfinite(dm) else np.nan
+    print(f"  {ad_a} vs {ad_b}:  ort_kayip_farki={ort:+.6f}  DM={dm:+.3f}  p={p:.4f}  "
+          f"{'-> ' + (ad_b if ort>0 else ad_a) + ' DAHA IYI' if p<0.10 else '-> fark anlamsiz'}")
+    return p
+dm_testi(y, pd_, p2, "Dummy", "v2c")
+dm_testi(y, p1,  p2, "v1   ", "v2c")
+print("\n  (DM testi 12 gozlemde dusuk gucludur; p<0.10 esigi kullanildi)")
+
+# ---------------------------------------------------------------- 11.5
 print("\n" + "=" * 110)
-print("10.D  v2 BIRLESIK: k-stabil payda + kisa pencere + kosullu duzeltme")
+print("11.5  NIHAI KARAR")
 print("=" * 110)
-# En k-stabil oncul (paydaya aday)
-EN_STABIL = V2.iloc[0].tam_ad
-print(f"  En k-stabil oncul: {EN_STABIL.replace('KK_TAKIP_','').replace(f'_{T}','')}"
-      f"  (k_CV={V2.iloc[0].k_CV:.1f}%, trend_p={V2.iloc[0].k_trend_p:.3f})\n")
-
-v2 = []
-for ad, s in SECILEN.items():
-    b_ay = s["bilgi_ay"]
-    payda_aday = [c for c in V2_HAVUZ if GEREKEN_AY.get(c,99) <= b_ay
-                  and (c.startswith("KK_TAKIP_") or c.startswith("RR_"))]
-    payda = payda_aday[0] if payda_aday else None
-    duz = 6 if b_ay >= 4 else None          # 9.3: sadece buyuk bilgi_ay'da calisiyor
-    senaryolar = [
-        ("v1 (taban)",            dict(max_gecmis=None, oran_paydasi=None,  duzelt_pencere=None)),
-        ("v2a kisa pencere",      dict(max_gecmis=30,   oran_paydasi=None,  duzelt_pencere=None)),
-        ("v2b + oransal",         dict(max_gecmis=30,   oran_paydasi=payda, duzelt_pencere=None)),
-        ("v2c + kosullu duzelt",  dict(max_gecmis=30,   oran_paydasi=payda, duzelt_pencere=duz)),
-    ]
-    for sad, kw in senaryolar:
-        if kw.get("oran_paydasi") is None and "oransal" in sad: continue
-        r = wf_pencereli(s["kolonlar"], s["aile"], b_ay, oot_idx,
-                         ek_kolonlar=s["ek"], yarilanma=s["yarilanma"], **kw)
-        if r: v2.append({"MERDIVEN":ad,"senaryo":sad,"WMAPE":r["WMAPE"],
-                         "SAPMA":r["SAPMA"],"POZ":f"{r['POZ']}/{r['N']}",
-                         "PEARSON":r["PEARSON"],"skill":1-r["WMAPE"]/DUMMY_W})
-V2S = pd.DataFrame(v2)
-for ad in V2S.MERDIVEN.unique():
-    print(f"\n  [{ad}]")
-    print(V2S[V2S.MERDIVEN==ad].round(4).to_string(index=False))
-
-print("\n" + "=" * 110)
-print("v2 OZET — her basamagin en iyi senaryosu")
-print("=" * 110)
-best = V2S.loc[V2S.groupby("MERDIVEN").WMAPE.idxmin()]
-best["erkenlik"] = best.MERDIVEN.map(
-    {k: CONFIG["HEDEF_OLGUNLASMA_AY"]-v["bilgi_ay"] for k,v in SECILEN.items()})
-print(best.sort_values("erkenlik", ascending=False).round(4).to_string(index=False))
+alt90 = np.percentile(sk, 5)
 print(f"""
-  Dummy WMAPE = {DUMMY_W:.3f}   (skill > 0 ise model Dummy'den iyi)
+  OLCULEN:
+    CHAMPION v2c  : WMAPE {r_v2c['WMAPE']:.2f}  skill {1-r_v2c['WMAPE']/r_dum['WMAPE']:+.3f}
+                    Pearson {r_v2c['PEARSON']:.3f}  sapma {r_v2c['SAPMA']:+.5f}
+                    skill %90 GA = [{np.percentile(sk,5):+.3f}, {np.percentile(sk,95):+.3f}]
+    Erken basamaklar (1-3 ay): hicbiri Dummy'yi gecemedi
 
-  KARAR:
-    skill > 0.15 olan basamak varsa  -> v2 yonu DOGRU, yeni OOT ile dogrula
-    hicbiri gecmiyorsa               -> sorun feature'da degil REJIMDE;
-                                        makro degisken / disal sinyal gerekiyor
+  YAPISAL BULGU:
+    Oransal model HER basamakta Pearson'u yukseltiyor (siralama iyilesiyor)
+    ama seviyeyi bozuyor. Seviye ancak TAZE ARTIK bilgisiyle geri kazanilabiliyor,
+    o da sadece bilgi_ay >= 4'te mumkun.
+    -> ERKENLIK/GUVENILIRLIK takasinin kritik esigi: 6 AY
+
+  URETIM ONERISI:
+    [EVET] CHAMPION v2c (6 ay) -> izlemeli pilot, su sartlarla:
+             - aylik PSI: MM_SKOR, 60_6, 30_2_MA3
+             - aylik sapma izleme: ardisik 3 ay ayni yonlu sapma -> ALARM
+             - 202510+ kohortlari olgunlastikca GERCEK OOT ile dogrula
+             - k-stabilite yeniden olc: k_son/ilk 0.85-1.15 disina cikarsa REKALIBRE
+    [HAYIR] 1-3 ay basamaklari -> uretime alinmaz, arastirma devam
+
+  v3 ICIN YON:
+    1. k-stabilite filtresini ORTAK ALANLARA da uygula (MM_SKOR K_SKOR=0.94!)
+    2. Erken basamaklar icin seviye cipasi ARA: makro (faiz, issizlik, TUFE),
+       portfoy kompozisyonu, kampanya/limit politikasi degiskenleri
+    3. OOT penceresini uzat (12 -> 18+) ve YENI bir OOT ayir
+    4. ADETSEL hedefi ayni akista kosup tutarsalla karsilastir
 """)
 print("=" * 110)
