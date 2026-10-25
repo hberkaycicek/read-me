@@ -1,169 +1,175 @@
 # ============================================================================
-# BLOK 6.2-EK — MM_SKOR DERINLEMESINE TESHIS
+# BLOK 6.7 — MM_SKOR GECIKME VE STABILITE TESTI
 #
-# BULGU: MM_SKOR cikinca WMAPE 3-5 KAT kotulesiyor VE sapma -0.004/-0.006'ya
-#        firliyor. Bu bir 'feature katkisi' degil, SEVIYE CIPASI davranisi.
+# BULGU (6.2-EK S2): MM_SKOR(t-5) hedefle r=+0.859, MM_SKOR(t) ise r=+0.598.
+#   -> MM_SKOR ONCU gosterge. Gecikmeli hali modelde KULLANILMIYOR.
+#   -> MM_SKOR(t-k) kohort t icin GEREKEN_AY=0 (gecmis kohortun skoru, bugun belli)
+#   -> Sizinti riski SIFIR, erkenlik bedeli SIFIR.
 #
-# CEVAPLANACAK SORULAR:
-#   S1  MM_SKOR tek basina ne yapiyor?
-#   S2  Hedefle ES ZAMANLI mi hareket ediyor? (seviye cipasi tezi)
-#   S3  Katsayi isareti IS MANTIGIYLA tutarli mi?
-#   S4  Alternatif seviye cipalari onun yerini tutar mi?
-#   S5  Fold bazinda sapma yapisi nasil degisiyor?
-#   S6  MODEL RISKI: MM_SKOR kayarsa tahmin ne kadar oynar?
+# AMA UYARI (6.2-EK S2): z-fark std=0.897, ilk/son yari kaymasi 0.64 std
+#   -> Iliski tam stabil degil. Gecikmeli korelasyon TREND ARTEFAKTI olabilir.
+#
+# BU BLOK:
+#   T1  Trend arindirilmis korelasyon — k=+5 bulgusu gercek mi?
+#   T2  Kayan pencerede korelasyon stabilitesi
+#   T3  MM_SKOR gecikmelerini URET ve sampiyon setlerde TEST et
+#   T4  Karar: havuza eklensin mi?
 # ============================================================================
 print("=" * 106)
-print("BLOK 6.2-EK — MM_SKOR DERINLEMESINE TESHIS")
+print("BLOK 6.7 — MM_SKOR GECIKME VE STABILITE TESTI")
 print("=" * 106)
-
 MM = "MM_SKOR"
-_s = d.loc[tr_idx, MM].dropna()
-print(f"\n  MM_SKOR: aralik=[{_s.min():.4f}, {_s.max():.4f}]  ort={_s.mean():.4f}  "
-      f"std={_s.std():.4f}  CV=%{100*_s.std()/_s.mean():.1f}")
-print(f"  HEDEF  : aralik=[{d.loc[tr_idx,HEDEF].min():.4f}, {d.loc[tr_idx,HEDEF].max():.4f}]  "
-      f"ort={d.loc[tr_idx,HEDEF].mean():.4f}")
-print(f"  MM_SKOR / HEDEF orani: {_s.mean()/d.loc[tr_idx,HEDEF].mean():.2f} kat")
-print(f"  >> MM_SKOR bir OLASILIK gibi gorunuyor (muhtemelen ortalama PD).")
 
-# ---------------------------------------------------------------- S1
+# ---------------------------------------------------------------- T1
 print("\n" + "-" * 106)
-print("S1  MM_SKOR TEK BASINA")
+print("T1  TREND ARINDIRILMIS KORELASYON — k=+5 bulgusu gercek mi?")
 print("-" * 106)
-solo = []
-for ad, b_ay in MERDIVEN.items():
-    for kk, et in [([MM], "MM_SKOR tek"),
-                   ([tek.iloc[0]["degisken"]], "en guclu oncul tek")]:
-        if max(GEREKEN_AY.get(c, 0) for c in kk) > b_ay: continue
-        r = cv_degerlendir(kk, "Linear", b_ay)
-        if r: solo.append({"MERDIVEN": ad, "model": et, "CV_WMAPE": r["CV_WMAPE"],
-                           "CV_SAPMA": r["CV_SAPMA"], "OVERFIT": r["OVERFIT_ORANI"],
-                           "YON": r["YON_BASARISI"]})
-print(pd.DataFrame(solo).round(4).to_string(index=False))
-print("\n  >> MM_SKOR tek basina ZAYIFSA ama kombinasyonda KRITIKSE,")
-print("     tamamlayici bilgi tasiyor demektir (seviye), oncul ise SIRALAMA tasiyor.")
+print("  Iki seri de trendliyse gecikmeli korelasyon YAPAY sisik cikar.")
+print("  Test: her iki seriden dogrusal trendi cikar, korelasyonu TEKRAR olc.\n")
 
-# ---------------------------------------------------------------- S2
-print("\n" + "-" * 106)
-print("S2  ES ZAMANLI HAREKET — seviye cipasi tezi")
-print("-" * 106)
-_tr = d.loc[tr_idx, [DONEM_KOL, MM, HEDEF]].dropna()
-print("  Gecikmeli korelasyonlar (MM_SKOR(t-k) ~ HEDEF(t)):")
-for k in range(-3, 7):
+def _detrend(s):
+    s = pd.Series(s).dropna()
+    t = np.arange(len(s))
+    return pd.Series(s.values - np.polyval(np.polyfit(t, s.values, 1), t), index=s.index)
+
+def _fark(s):
+    return pd.Series(s).diff()
+
+_base = d.loc[tr_idx]
+rows = []
+for k in range(0, 8):
     x = d[MM].shift(k)
-    m_ = pd.concat([x.rename("x"), d[HEDEF]], axis=1).loc[tr_idx].dropna()
-    if len(m_) > 15:
-        r_ = m_.corr().iloc[0, 1]
-        isaret = " <-- ES ZAMANLI" if k == 0 else ""
-        print(f"    k={k:+2d} : r={r_:+.4f}  (n={len(m_)}){isaret}")
-print("\n  Seviye takibi: iki serinin NORMALIZE edilmis hali ne kadar ortusuyor?")
-_z1 = (_tr[MM] - _tr[MM].mean())/_tr[MM].std()
-_z2 = (_tr[HEDEF] - _tr[HEDEF].mean())/_tr[HEDEF].std()
-print(f"    z-skor farkinin std'si: {(_z1-_z2).std():.4f}  (0'a yakin = birlikte hareket)")
-print(f"    ilk yari ort fark: {(_z1-_z2).iloc[:len(_z1)//2].mean():+.4f}   "
-      f"son yari: {(_z1-_z2).iloc[len(_z1)//2:].mean():+.4f}")
-print("    >> Iki yari arasindaki fark kucukse, iliski ZAMAN ICINDE STABIL.")
-
-# ---------------------------------------------------------------- S3
-print("\n" + "-" * 106)
-print("S3  KATSAYI ISARETI VE BUYUKLUGU")
-print("-" * 106)
-for ad in MERDIVEN:
-    g = SONUC[ad][SONUC[ad].GECERLI]
-    if len(g) == 0: continue
-    b = g.iloc[0]; kk = [c.strip() for c in b.GIRDILER.split(",")]
-    sub = d.loc[tr_idx, kk + [HEDEF]].dropna()
-    pp = pipeline_kur("Linear"); pp.fit(sub[kk], sub[HEDEF])
-    sc, reg = pp[0], pp[-1]
-    ham = reg.coef_ / sc.scale_
-    b0 = float(reg.intercept_ - np.dot(ham, sc.mean_))
-    print(f"\n  [{ad}]  sabit={b0:+.6f}")
-    for c, kat in zip(kk, ham):
-        etki = kat * d.loc[tr_idx, c].std()     # 1 std oynamanin etkisi
-        print(f"    {c:32s} katsayi={kat:+12.6f}   1-std etkisi={etki:+.5f}  "
-              f"({100*etki/d.loc[tr_idx,HEDEF].mean():+.1f}% hedefin)")
-print("\n  >> MM_SKOR bir PD ise katsayisi POZITIF olmali (PD artar -> 12M90 artar).")
-print("  >> 1-std etkisi, degiskenin GERCEK agirligini gosterir (katsayi x oynaklik).")
-
-# ---------------------------------------------------------------- S4
-print("\n" + "-" * 106)
-print("S4  ALTERNATIF SEVIYE CIPALARI — MM_SKOR'un yerini tutan var mi?")
-print("-" * 106)
-ADAY_CIPA = [MM, "KKB_MERKEZ", "KALIBRE_PD_AGIRLIKLI", "HEDEF_L9_12_ORT", "HEDEF_L9"]
-ADAY_CIPA = [c for c in ADAY_CIPA if c in d.columns]
-cip = []
-for ad in ["CHALLENGER", "CHAMPION"]:
-    g = SONUC[ad][SONUC[ad].GECERLI]
-    if len(g) == 0: continue
-    b = g.iloc[0]; kk = [c.strip() for c in b.GIRDILER.split(",")]
-    cekirdek = [c for c in kk if c != MM]
-    for cp in [None] + ADAY_CIPA:
-        kol = cekirdek + ([cp] if cp else [])
-        if not kol: continue
-        if cp and GEREKEN_AY.get(cp, 0) > MERDIVEN[ad]: continue
-        r = cv_degerlendir(kol, b.AILE, MERDIVEN[ad])
-        if r: cip.append({"MERDIVEN": ad, "cipa": cp or "(yok)", "K": r["K"],
-                          "CV_WMAPE": r["CV_WMAPE"], "CV_SAPMA": r["CV_SAPMA"],
-                          "OVERFIT": r["OVERFIT_ORANI"], "ISARET": r["ISARET_SERISI"]})
-CIP = pd.DataFrame(cip)
-print(CIP.round(4).to_string(index=False))
-print("\n  >> Hicbir alternatif MM_SKOR'a yaklasamiyorsa, model ona BAGIMLI demektir.")
-print("     Bu bir bulgu, ama ayni zamanda MODEL RISKI — S6'da olculecek.")
-
-# ---------------------------------------------------------------- S5
-print("\n" + "-" * 106)
-print("S5  FOLD BAZINDA SAPMA YAPISI")
-print("-" * 106)
-for ad in ["CHALLENGER", "ORTA"]:
-    g = SONUC[ad][SONUC[ad].GECERLI]
-    if len(g) == 0: continue
-    b = g.iloc[0]; kk = [c.strip() for c in b.GIRDILER.split(",")]
-    r1 = cv_degerlendir(kk, b.AILE, MERDIVEN[ad])
-    r2 = cv_degerlendir([c for c in kk if c != MM], b.AILE, MERDIVEN[ad])
-    print(f"\n  [{ad}]")
-    print(f"    MM_SKOR ILE  : fold sapmalari = {r1['FOLD_SAPMALAR']}  isaret_serisi={r1['ISARET_SERISI']}")
-    if r2:
-        print(f"    MM_SKOR'SUZ  : fold sapmalari = {r2['FOLD_SAPMALAR']}  isaret_serisi={r2['ISARET_SERISI']}")
-print("\n  >> MM_SKOR'suz TUM fold'lar ayni yonde sapiyorsa, model seviyeyi")
-print("     yakalayamiyor demektir. Onceki modelin OOT'deki 12/12 felaketinin aynisi.")
-
-# ---------------------------------------------------------------- S6
-print("\n" + "-" * 106)
-print("S6  MODEL RISKI — MM_SKOR kayarsa tahmin ne kadar oynar?")
-print("-" * 106)
-print("  SENARYO: uretimde skor karti rekalibre edilirse MM_SKOR seviyesi kayar.")
-print("  Duyarlilik: MM_SKOR'a +/- x std sok uygulanirsa tahmin ne olur?\n")
-for ad in ["CHALLENGER", "CHAMPION"]:
-    g = SONUC[ad][SONUC[ad].GECERLI]
-    if len(g) == 0: continue
-    b = g.iloc[0]; kk = [c.strip() for c in b.GIRDILER.split(",")]
-    if MM not in kk: continue
-    sub = d.loc[tr_idx, kk + [HEDEF]].dropna()
-    pp = pipeline_kur(b.AILE); pp.fit(sub[kk], sub[HEDEF])
-    taban = pp.predict(sub[kk]).mean()
-    sd = sub[MM].std()
-    print(f"  [{ad}]  taban ortalama tahmin = {taban:.5f}  (gerceklesen {sub[HEDEF].mean():.5f})")
-    for sok in [-2, -1, -0.5, 0.5, 1, 2]:
-        s2 = sub.copy(); s2[MM] = s2[MM] + sok*sd
-        yeni = pp.predict(s2[kk]).mean()
-        print(f"    MM_SKOR {sok:+.1f} std -> tahmin {yeni:.5f}  "
-              f"({100*(yeni/taban-1):+6.1f}%)")
-print("\n  >> +/-1 std sokta tahmin %20'den fazla oynuyorsa, MM_SKOR icin")
-print("     AYLIK PSI IZLEMESI zorunlu hale gelir. Izleme esigi BLOK 10'a yazilacak.")
-
-print("\n" + "=" * 106)
-print("MM_SKOR KARAR CERCEVESI")
-print("=" * 106)
+    m_ = pd.concat([x.rename("x"), d[HEDEF].rename("y")], axis=1).loc[tr_idx].dropna()
+    if len(m_) < 18: continue
+    r_ham = m_.corr().iloc[0, 1]
+    r_det = _detrend(m_.x).corr(_detrend(m_.y))
+    md = pd.concat([_fark(m_.x), _fark(m_.y)], axis=1).dropna()
+    r_dif = md.corr().iloc[0, 1] if len(md) > 10 else np.nan
+    rows.append({"k": k, "n": len(m_), "r_HAM": r_ham,
+                 "r_TRENDSIZ": r_det, "r_FARK": r_dif})
+T1 = pd.DataFrame(rows)
+print(T1.round(4).to_string(index=False))
 print("""
-  MM_SKOR'u MODELDE TUT eger:
-    - Katsayi isareti is mantigiyla tutarli (PD artar -> 12M90 artar)
-    - Es zamanli korelasyon gecikmelilerden guclu (seviye cipasi tezi)
-    - z_OOT dusuk ve disari=0 (zaten dogrulandi: 0.600 / 0.000)
-    - Alternatif cipa yok
+  OKUMA:
+    r_HAM      : ham korelasyon (6.2-EK'teki deger)
+    r_TRENDSIZ : dogrusal trend cikarildiktan sonra
+    r_FARK     : birinci farklar uzerinde (en sert test, seviyeyi tamamen siler)
 
-  ANCAK zorunlu onlemler:
-    1. MM_SKOR icin AYLIK PSI izlemesi (esik: |z| > 1.0 -> alarm)
-    2. Skor karti versiyon degisikligi -> MODEL YENIDEN KALIBRE EDILMELI
-    3. Model dokumanina 'tek degisken bagimliligi' riski yazilmali
-    4. MM_SKOR'suz yedek model (degraded mode) hazir tutulmali
+  >> r_HAM yuksek ama r_TRENDSIZ/r_FARK DUSUKSE -> TREND ARTEFAKTI, kullanma.
+  >> Ucu de yuksekse -> GERCEK onculuk, havuza al.
 """)
+_en_iyi_k = int(T1.loc[T1.r_TRENDSIZ.idxmax(), "k"]) if T1.r_TRENDSIZ.notna().any() else 0
+print(f"  Trendsiz korelasyonun EN YUKSEK oldugu gecikme: k={_en_iyi_k}")
+
+# ---------------------------------------------------------------- T2
+print("\n" + "-" * 106)
+print("T2  KAYAN PENCEREDE KORELASYON STABILITESI")
+print("-" * 106)
+print("  6.2-EK: ilk yari ort fark -0.329, son yari +0.313 -> 0.64 std kayma.")
+print("  Iliski zaman icinde kayiyorsa, uretimde bozulur.\n")
+W = 18
+olg2 = d[d.HEDEF_KULLANILABILIR].reset_index(drop=True)
+kay2 = []
+for i in range(len(olg2) - W + 1):
+    w = olg2.iloc[i:i+W]
+    sat = {"pencere": f"{w[DONEM_KOL].iloc[0]}-{w[DONEM_KOL].iloc[-1]}"}
+    for k in [0, 3, 5]:
+        xx = olg2[MM].shift(k).iloc[i:i+W]
+        mm_ = pd.concat([xx.rename("x"), w[HEDEF].rename("y")], axis=1).dropna()
+        sat[f"r_k{k}"] = mm_.corr().iloc[0, 1] if len(mm_) > 10 else np.nan
+    kay2.append(sat)
+KAY2 = pd.DataFrame(kay2)
+print(KAY2.round(3).to_string(index=False))
+print("\n  KORELASYON OYNAKLIGI (dusuk = stabil):")
+for k in [0, 3, 5]:
+    s = KAY2[f"r_k{k}"].dropna()
+    print(f"    k={k}: ort={s.mean():+.3f}  std={s.std():.3f}  "
+          f"min={s.min():+.3f}  max={s.max():+.3f}  aralik={s.max()-s.min():.3f}")
+print("  >> std kucuk VE isaret hic degismiyor -> guvenilir. Aksi halde riskli.")
+
+# ---------------------------------------------------------------- T3
+print("\n" + "-" * 106)
+print("T3  MM_SKOR GECIKMELERINI URET VE SAMPIYON SETLERDE TEST ET")
+print("-" * 106)
+# Gecikmeli MM_SKOR: kohort t icin MM_SKOR(t-k), basvuru aninda ZATEN bilinir
+for k in [1, 2, 3, 4, 5, 6]:
+    ad = f"{MM}_L{k}"
+    d[ad] = d[MM].shift(k)
+    GEREKEN_AY[ad] = 0           # gecmis kohortun skoru -> bugun belli
+    AILE.setdefault("G_KKB", []).append(ad)
+d[f"{MM}_MA3"]   = d[MM].rolling(3, min_periods=3).mean(); GEREKEN_AY[f"{MM}_MA3"] = 0
+d[f"{MM}_MA3L3"] = d[MM].shift(3).rolling(3, min_periods=3).mean(); GEREKEN_AY[f"{MM}_MA3L3"] = 0
+MM_ADAYLAR = [MM] + [f"{MM}_L{k}" for k in [1,2,3,4,5,6]] + [f"{MM}_MA3", f"{MM}_MA3L3"]
+print(f"  Uretildi: {MM_ADAYLAR}")
+print(f"  Hepsinin GEREKEN_AY = 0  (gecmis kohortun skoru, kohort acildiginda belli)\n")
+
+sonuc67 = []
+for ad in MERDIVEN:
+    g = NIHAI[ad][NIHAI[ad].GECERLI] if "NIHAI" in dir() else SONUC[ad][SONUC[ad].GECERLI]
+    if len(g) == 0: continue
+    b = g.iloc[0]
+    kols = [c.strip() for c in b.GIRDILER.split(",")]
+    ek   = [c for c in kols if c in ("SIN_AY","COS_AY")]
+    ana  = [c for c in kols if c not in ("SIN_AY","COS_AY")]
+    if MM not in ana: continue
+    yar = float(b.YARILANMA) if "YARILANMA" in b.index else 1.0
+    for mm_var in MM_ADAYLAR:
+        kol = [c if c != MM else mm_var for c in ana]
+        CONFIG["ZAMAN_YARILANMA"] = yar
+        r = cv_degerlendir(kol, b.AILE, MERDIVEN[ad], ek_kolonlar=ek)
+        CONFIG["ZAMAN_YARILANMA"] = 1.0
+        if r:
+            sonuc67.append({"MERDIVEN": ad, "MM_varyant": mm_var,
+                            "CV_WMAPE": r["CV_WMAPE"], "CV_SAPMA": r["CV_SAPMA"],
+                            "EN_KOTU": r["EN_KOTU_WMAPE"], "OVERFIT": r["OVERFIT_ORANI"],
+                            "MAKS_VIF": r["MAKS_VIF"], "ISARET": r["ISARET_SERISI"]})
+S67 = pd.DataFrame(sonuc67)
+for ad in S67.MERDIVEN.unique():
+    s = S67[S67.MERDIVEN == ad].sort_values("CV_WMAPE")
+    taban = s[s.MM_varyant == MM].CV_WMAPE.iloc[0]
+    s = s.copy(); s["KAZANC"] = (taban - s.CV_WMAPE).round(3)
+    print(f"\n  [{ad}]  taban (MM_SKOR es zamanli) = {taban:.4f}")
+    print(s.round(4).to_string(index=False))
+
+# ---------------------------------------------------------------- T4
+print("\n" + "=" * 106)
+print("T4  KARAR")
+print("=" * 106)
+kaz = []
+for ad in S67.MERDIVEN.unique():
+    s = S67[S67.MERDIVEN == ad]
+    taban = s[s.MM_varyant == MM].CV_WMAPE.iloc[0]
+    en = s.sort_values("CV_WMAPE").iloc[0]
+    kaz.append({"MERDIVEN": ad, "taban": taban, "en_iyi_varyant": en.MM_varyant,
+                "en_iyi_WMAPE": en.CV_WMAPE, "KAZANC": taban - en.CV_WMAPE,
+                "sapma": en.CV_SAPMA, "overfit": en.OVERFIT})
+KAZ = pd.DataFrame(kaz)
+print(KAZ.round(4).to_string(index=False))
+
+_ort_kazanc = KAZ.KAZANC.mean()
+_kazanan_n  = int((KAZ.en_iyi_varyant != MM).sum())
+print(f"\n  Gecikmeli varyant kazanan basamak : {_kazanan_n} / {len(KAZ)}")
+print(f"  Ortalama kazanc                   : {_ort_kazanc:+.3f} WMAPE")
+print(f"""
+  KARAR KURALI:
+    EKLE   eger (a) T1'de r_TRENDSIZ ve r_FARK da yuksek  VE
+                 (b) T2'de korelasyon isaret degistirmiyor, std dusuk  VE
+                 (c) T3'te >=3 basamakta kazanc > 0.3 WMAPE
+    EKLEME eger T1'de sadece r_HAM yuksekse -> TREND ARTEFAKTI
+
+  >> EKLENIRSE: BLOK 3.8 havuzlarina MM_SKOR gecikmeleri dahil edilip
+     BLOK 5 grid'i YENIDEN calistirilmali (havuz degisti).
+  >> EKLENMEZSE: mevcut merdiven aynen BLOK 7 hakemligine gider.
+""")
+
+# Havuza otomatik ekleme (kriterler saglanirsa)
+_T1ok = bool(T1.loc[T1.k == _en_iyi_k, "r_FARK"].abs().iloc[0] > 0.30) if len(T1) else False
+_T2ok = bool(all(KAY2[f"r_k{_en_iyi_k}"].dropna() > 0)) if f"r_k{_en_iyi_k}" in KAY2 else False
+_T3ok = bool((KAZ.KAZANC > 0.3).sum() >= 3)
+print(f"  T1 (trend arindirilmis guclu) : {_T1ok}")
+print(f"  T2 (isaret stabil)            : {_T2ok}")
+print(f"  T3 (>=3 basamakta kazanc)     : {_T3ok}")
+MM_GECIKME_EKLE = _T1ok and _T2ok and _T3ok
+print(f"\n  >>> SONUC: MM_SKOR gecikmeleri havuza "
+      f"{'EKLENECEK -> BLOK 5 yeniden calistirilmali' if MM_GECIKME_EKLE else 'EKLENMEYECEK -> BLOK 7 ile devam'}")
 print("=" * 106)
