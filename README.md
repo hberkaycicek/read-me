@@ -1,245 +1,153 @@
 # ============================================================================
-# BLOK 7 — ARA BOLGESI HAKEMLIGI
+# BLOK 7.6 — ADAPTIF AGIRLIK VE NIHAI SECIM
 #
-# NEDEN BU BLOK VAR:
-#   Onceki calismada CV sampiyonu CHALLENGER'i (CV 9.63) gosteriyordu,
-#   OOT ise tam tersini soyledi (OOT 21.36, sonuncu). CV->OOT bozulmasi %61-122.
-#   Sebep: 9.260 varyant arasindan CV'ye gore secim -> SECIM YANLILIGI.
+# SORUN: 7.4'te sabit agirlik (0.40 CV / 0.45 ARA) kullandik.
+#        Ama 7.3 gosterdi ki CV'nin guvenilirligi BASAMAGA GORE DEGISIYOR:
+#          ULTRA_ERKEN : Spearman -0.785 (p<0.0001)  -> CV TERS calisiyor
+#          ORTA        : Spearman +0.603 (p=0.005)   -> CV guvenilir
+#        Sabit agirlik, CV'nin ters calistigi basamakta YANLIS secim yapiyor.
 #
-#   TRAIN'de en iyi gorunen model, CV fold'larinin gurultusune de uymustur.
-#   Bunu kiracak tek sey: SECIMDE HIC KULLANILMAMIS bagimsiz bir bolge.
+# COZUM: CV agirligi, o basamaktaki CV-ARA uyumuna gore UYARLANIR.
+#        Bu bir hiperparametre ayari degil; olculen bir gercegin modele yansitilmasi.
 #
-# BU BLOKTA:
-#   7.1  ARA walk-forward motoru (uretim senaryosunun birebir simulasyonu)
-#   7.2  Her basamagin ilk N adayi ARA'da sinanir
-#   7.3  CV -> ARA siralama tutarliligi (Spearman) = secim yanliliginin OLCUSU
-#   7.4  Birlesik secim: CV + ARA
-#   7.5  Nihai adaylar -> OOT'ye SADECE bunlar gider
-#
-# ONEMLI UYARI: ARA'da yalnizca 6 kohort var. WMAPE gurultulu olacak.
-#   Bu yuzden ARA tek basina karar vermez; CV ile BIRLIKTE degerlendirilir.
+# AYRICA:
+#   - Yanlilik agirligi 0.15 -> 0.20 (bu projenin ana riski)
+#   - ARA_POZ dengesi kriteri eklendi (0/6 veya 6/6 -> tek yonlu sapma)
+#   - "Sadece ARA ile secseydik ne olurdu?" karsilastirmasi
 # ============================================================================
 print("=" * 108)
-print("BLOK 7 — ARA BOLGESI HAKEMLIGI")
+print("BLOK 7.6 — ADAPTIF AGIRLIK VE NIHAI SECIM")
 print("=" * 108)
 
-# ---------------------------------------------------------------- 7.1
+YANB = YAN.set_index("MERDIVEN")
+
+def adaptif_agirlik(rho_rank, rho_wmape):
+    """
+    CV agirligi, CV siralamasinin ARA'da ne kadar tuttuguna gore belirlenir.
+    Iki Spearman'in KUCUGU esas alinir (muhafazakar).
+    """
+    rho = min(rho_rank, rho_wmape)
+    if   rho >= 0.50: return 0.45, 0.35, 0.20, "CV GUVENILIR"
+    elif rho >= 0.20: return 0.35, 0.45, 0.20, "CV kismen guvenilir"
+    elif rho >= 0.00: return 0.25, 0.55, 0.20, "CV zayif"
+    else:             return 0.10, 0.70, 0.20, "CV TERS CALISIYOR"
+
+print("\n  BASAMAK BAZLI AGIRLIKLAR (7.3'teki Spearman'a gore):\n")
+AG = {}
+for ad in ARA_SONUC:
+    if ad not in YANB.index: continue
+    rw = float(YANB.loc[ad, "Spearman_WMAPE"]); rr = float(YANB.loc[ad, "Spearman_RANK"])
+    w_cv, w_ara, w_yan, etiket = adaptif_agirlik(rr, rw)
+    AG[ad] = (w_cv, w_ara, w_yan)
+    print(f"    {ad:12s} rho_WMAPE={rw:+.3f}  rho_RANK={rr:+.3f}  ->  "
+          f"CV={w_cv:.2f} ARA={w_ara:.2f} YANLI={w_yan:.2f}   [{etiket}]")
+
 print("\n" + "-" * 108)
-print("7.1  ARA WALK-FORWARD MOTORU")
+print("NIHAI SECIM")
 print("-" * 108)
-print("""
-  Her hedef kohort icin:
-    tahmin_ay = kohort_ay + bilgi_ay
-    egitim    = HEDEF_ERISIM < tahmin_ay olan TUM olgun kohortlar
-    -> yani 'o tarihte elimde ne vardiysa' ile egit, sonra tahmin et.
-
-  Bu, BLOK 4'teki CV'den FARKLI ve daha gercekci:
-    CV      : sabit fold yapisi, 3 blok
-    walk-fwd: her kohort icin model YENIDEN egitilir, egitim seti BUYUR
-  Uretimde olan budur.
-""")
-
-def walkforward(kolonlar, aile, bilgi_ay, hedef_idx, yarilanma=1.0, ek_kolonlar=None):
-    kol = list(kolonlar) + list(ek_kolonlar or [])
-    olgun = d[d.HEDEF_KULLANILABILIR]
-    tah, ger, eg_n, don = [], [], [], []
-    for i in hedef_idx:
-        c = d.loc[i]
-        tahmin_ay = c["AY"] + bilgi_ay
-        eg = olgun[olgun["HEDEF_ERISIM"] < tahmin_ay][kol + [HEDEF]].dropna()
-        if len(eg) < MIN_TRAIN:
-            continue
-        x = d.loc[[i], kol]
-        if x.isna().any(axis=None):
-            continue
-        pipe = pipeline_kur(aile)
-        _eski = CONFIG.get("ZAMAN_YARILANMA", 1.0)
-        CONFIG["ZAMAN_YARILANMA"] = yarilanma
-        w = _agirlik(eg.index)
-        _fit_agirlikli(pipe, eg[kol], eg[HEDEF], w, aile)
-        CONFIG["ZAMAN_YARILANMA"] = _eski
-        tah.append(float(np.clip(pipe.predict(x)[0], 0, 1)))
-        ger.append(float(c[HEDEF])); eg_n.append(len(eg)); don.append(c[DONEM_KOL])
-    if len(tah) == 0:
-        return None
-    y, p = np.array(ger), np.array(tah)
-    m = temel_metrikler(y, p)
-    e = p - y
-    return {"N": len(y), "WMAPE": m["WMAPE"], "MAPE": m["MAPE"], "MAE": m["MAE"],
-            "RMSE": m["RMSE"], "SAPMA": m["SAPMA"], "MUTLAK_SAPMA": abs(m["SAPMA"]),
-            "BIAS_ORANI": abs(m["SAPMA"])/m["MAE"] if m["MAE"] > 0 else np.nan,
-            "POZ_SAPMA": int((e > 0).sum()),
-            "EN_KOTU_MUTLAK": float(np.max(np.abs(e))),
-            "EGITIM_N_ILK": eg_n[0], "EGITIM_N_SON": eg_n[-1],
-            "_don": don, "_ger": ger, "_tah": tah}
-
-# Motor dogrulamasi: ARA'da egitim seti gercekten buyuyor mu?
-_test = walkforward([CHALLENGER_BUDANMIS[0]], "Linear", 3, ara_idx)
-if _test:
-    print(f"  Dogrulama [ARA, bilgi_ay=3]: {_test['N']} kohort tahmin edildi, "
-          f"egitim seti {_test['EGITIM_N_ILK']} -> {_test['EGITIM_N_SON']} satir")
-    print(f"  Donemler: {_test['_don']}")
-print("  >> Egitim seti BUYUYORSA walk-forward dogru calisiyor.")
-
-# ---------------------------------------------------------------- 7.2
-print("\n" + "-" * 108)
-print("7.2  ADAYLARI ARA'DA SINA")
-print("-" * 108)
-ARA_N = CONFIG.get("ARA_ADAY_N", 20)
-print(f"  Her basamagin ilk {ARA_N} GECERLI adayi ARA bolgesinde sinaniyor.")
-print(f"  ARA = {d.loc[ara_idx, DONEM_KOL].min()} .. {d.loc[ara_idx, DONEM_KOL].max()}  "
-      f"({len(ara_idx)} kohort)\n")
-
-ARA_SONUC = {}
+NIHAI_ADAY2, fin2, kiyas = {}, [], []
 for ad, b_ay in MERDIVEN.items():
-    kaynak = NIHAI[ad] if "NIHAI" in dir() else SONUC[ad]
-    g = kaynak[kaynak.GECERLI].head(ARA_N)
-    if len(g) == 0:
-        print(f"  [{ad}] gecerli aday yok, atlaniyor"); continue
-    rows = []
-    for _, b in g.iterrows():
-        kols = [c.strip() for c in b.GIRDILER.split(",")]
-        ek   = [c for c in kols if c in ("SIN_AY","COS_AY")]
-        ana  = [c for c in kols if c not in ("SIN_AY","COS_AY")]
-        yar  = float(b.YARILANMA) if "YARILANMA" in b.index and pd.notna(b.YARILANMA) else 1.0
-        r = walkforward(ana, b.AILE, b_ay, ara_idx, yarilanma=yar, ek_kolonlar=ek)
-        if r is None: continue
-        rows.append({
-            "GIRDILER": b.GIRDILER, "K": int(b.K), "AILE": b.AILE, "YARILANMA": yar,
-            "MEVSIM": int(b.MEVSIM) if "MEVSIM" in b.index else 0,
-            "CV_WMAPE": b.CV_WMAPE, "CV_SAPMA": b.CV_SAPMA,
-            "CV_RANK": b.RANK_SKORU,
-            "ARA_WMAPE": r["WMAPE"], "ARA_SAPMA": r["SAPMA"],
-            "ARA_MUTLAK_SAPMA": r["MUTLAK_SAPMA"], "ARA_BIAS_ORANI": r["BIAS_ORANI"],
-            "ARA_POZ": f"{r['POZ_SAPMA']}/{r['N']}",
-            "ARA_EN_KOTU": r["EN_KOTU_MUTLAK"], "ARA_N": r["N"],
-        })
-    if not rows: continue
-    D_ = pd.DataFrame(rows)
-    D_["BOZULMA"]   = D_.ARA_WMAPE - D_.CV_WMAPE
-    D_["BOZULMA_%"] = 100*(D_.ARA_WMAPE/D_.CV_WMAPE - 1)
-    ARA_SONUC[ad] = D_
-    print(f"\n  [{ad}]  {len(D_)} aday ARA'da sinandi")
-    t = D_.sort_values("ARA_WMAPE").head(6).copy()
-    t["GIRDILER"] = t.GIRDILER.str.replace("KK_TAKIP_","").str.replace(f"_{T}","")
-    print(t[["GIRDILER","AILE","YARILANMA","CV_WMAPE","ARA_WMAPE","BOZULMA_%",
-             "ARA_SAPMA","ARA_POZ","ARA_EN_KOTU"]].round(4).to_string(index=False))
-
-# ---------------------------------------------------------------- 7.3
-print("\n" + "=" * 108)
-print("7.3  SECIM YANLILIGININ OLCUSU — CV siralamasi ARA'da tutuyor mu?")
-print("=" * 108)
-print("""
-  Spearman korelasyonu: CV siralamasi ile ARA siralamasi ne kadar ortusuyor?
-    rho ~ +1 : CV guvenilir, secim yanliligi kucuk
-    rho ~  0 : CV siralamasi ARA'da ANLAMSIZ -> secim sansa dayali
-    rho <  0 : CV'de iyi olan ARA'da KOTU -> klasik overfit imzasi
-""")
-yan = []
-for ad, D_ in ARA_SONUC.items():
-    if len(D_) < 5: continue
-    rho, p = stats.spearmanr(D_.CV_WMAPE, D_.ARA_WMAPE)
-    rho_r, _ = stats.spearmanr(D_.CV_RANK, D_.ARA_WMAPE)
-    cv_en_iyi  = D_.sort_values("CV_WMAPE").iloc[0]
-    ara_en_iyi = D_.sort_values("ARA_WMAPE").iloc[0]
-    yan.append({
-        "MERDIVEN": ad, "n_aday": len(D_),
-        "Spearman_WMAPE": rho, "p": p, "Spearman_RANK": rho_r,
-        "CV_birincisinin_ARA_sirasi": int(D_.ARA_WMAPE.rank().loc[cv_en_iyi.name]),
-        "ort_BOZULMA_%": D_["BOZULMA_%"].mean(),
-        "CV1_ARA_WMAPE": cv_en_iyi.ARA_WMAPE,
-        "ARA_EN_IYI_WMAPE": ara_en_iyi.ARA_WMAPE,
-        "KAYIP": cv_en_iyi.ARA_WMAPE - ara_en_iyi.ARA_WMAPE,
-    })
-YAN = pd.DataFrame(yan)
-print(YAN.round(4).to_string(index=False))
-print("""
-  OKUMA:
-    CV_birincisinin_ARA_sirasi : 1 ise CV mukemmel secmis; buyukse yanlilik var
-    KAYIP : CV birincisini secerek ARA'da kaybettigimiz WMAPE puani
-    ort_BOZULMA_% : ARA'da hatanin CV'ye gore ne kadar arttigi
-""")
-
-# ---------------------------------------------------------------- 7.4
-print("-" * 108)
-print("7.4  BIRLESIK SECIM — CV + ARA")
-print("-" * 108)
-print("""
-  Ne saf CV'ye ne saf ARA'ya guveniyoruz:
-    CV : 39 kohort, 3 fold, ama SECIMDE KULLANILDI -> yanli
-    ARA:  6 kohort, bagimsiz, ama COK KUCUK -> gurultulu
-
-  Birlesik skor = 0.40*CV_rank + 0.45*ARA_rank + 0.15*ARA_yanlilik_rank
-  Ayrica ELEME: ARA'da tum sapmalar ayni yonlu VE buyukse diskalifiye.
-""")
-NIHAI_ADAY = {}
-for ad, D_ in ARA_SONUC.items():
-    X = D_.copy()
+    if ad not in ARA_SONUC: continue
+    X = ARA_SONUC[ad].copy()
+    w_cv, w_ara, w_yan = AG.get(ad, (0.35, 0.45, 0.20))
     X["R_CV"]    = X.CV_WMAPE.rank(pct=True)
     X["R_ARA"]   = X.ARA_WMAPE.rank(pct=True)
     X["R_YANLI"] = X.ARA_MUTLAK_SAPMA.rank(pct=True)
-    X["BIRLESIK"] = 0.40*X.R_CV + 0.45*X.R_ARA + 0.15*X.R_YANLI
-    # Eleme: ARA'da tek yonlu VE buyuk sapma (onceki modelin 12/12 felaketi)
-    n_ara = X.ARA_N.iloc[0]
+    X["BIRLESIK2"] = w_cv*X.R_CV + w_ara*X.R_ARA + w_yan*X.R_YANLI
+
+    # ELEME 1: tek yonlu VE buyuk sapma
+    n_ara = int(X.ARA_N.iloc[0])
     tek_yon = X.ARA_POZ.isin([f"{n_ara}/{n_ara}", f"0/{n_ara}"])
     buyuk   = X.ARA_MUTLAK_SAPMA > d.loc[ara_idx, HEDEF].mean()*0.12
-    X["ARA_ELENDI"] = tek_yon & buyuk
-    X = X.sort_values(["ARA_ELENDI", "BIRLESIK"], ascending=[True, True])
-    NIHAI_ADAY[ad] = X
-    print(f"\n  [{ad}]  elenen: {int(X.ARA_ELENDI.sum())}/{len(X)}")
-    t = X.head(5).copy()
-    t["GIRDILER"] = t.GIRDILER.str.replace("KK_TAKIP_","").str.replace(f"_{T}","")
-    print(t[["GIRDILER","AILE","YARILANMA","CV_WMAPE","ARA_WMAPE","ARA_SAPMA",
-             "ARA_POZ","BIRLESIK","ARA_ELENDI"]].round(4).to_string(index=False))
+    X["ELE_YANLI"] = tek_yon & buyuk
+    # ELEME 2: ARA'da en kotu tekil hata cok buyukse
+    X["ELE_UC"] = X.ARA_EN_KOTU > d.loc[ara_idx, HEDEF].mean()*0.45
+    X["ELENDI"] = X.ELE_YANLI | X.ELE_UC
 
-# ---------------------------------------------------------------- 7.5
-print("\n" + "=" * 108)
-print("7.5  NIHAI MERDIVEN — OOT'ye gidecek modeller")
-print("=" * 108)
-SECILEN = {}
-fin = []
-for ad, b_ay in MERDIVEN.items():
-    if ad not in NIHAI_ADAY: continue
-    X = NIHAI_ADAY[ad]
-    X = X[~X.ARA_ELENDI] if (~X.ARA_ELENDI).any() else X
-    b = X.iloc[0]
+    X = X.sort_values(["ELENDI", "BIRLESIK2"], ascending=[True, True])
+    NIHAI_ADAY2[ad] = X
+    G = X[~X.ELENDI] if (~X.ELENDI).any() else X
+    b = G.iloc[0]
+
+    # Kiyas: eski sabit agirlik / sadece ARA / sadece CV ne secerdi?
+    eski = NIHAI_ADAY[ad][~NIHAI_ADAY[ad].ARA_ELENDI].iloc[0] \
+           if ad in NIHAI_ADAY and (~NIHAI_ADAY[ad].ARA_ELENDI).any() else None
+    sade_ara = X.sort_values("ARA_WMAPE").iloc[0]
+    sade_cv  = X.sort_values("CV_WMAPE").iloc[0]
+    kiyas.append({"MERDIVEN": ad,
+                  "SADECE_CV_ARA_WMAPE":  sade_cv.ARA_WMAPE,
+                  "SABIT_AGIRLIK_ARA":    eski.ARA_WMAPE if eski is not None else np.nan,
+                  "ADAPTIF_ARA":          b.ARA_WMAPE,
+                  "SADECE_ARA_ARA_WMAPE": sade_ara.ARA_WMAPE})
+
     kols = [c.strip() for c in b.GIRDILER.split(",")]
     SECILEN[ad] = {"kolonlar": [c for c in kols if c not in ("SIN_AY","COS_AY")],
                    "ek": [c for c in kols if c in ("SIN_AY","COS_AY")],
                    "aile": b.AILE, "bilgi_ay": b_ay, "yarilanma": float(b.YARILANMA)}
-    fin.append({"MERDIVEN": ad, "bilgi_ay": b_ay,
-                "erkenlik": CONFIG["HEDEF_OLGUNLASMA_AY"]-b_ay,
-                "etkin_ay": max(GEREKEN_AY.get(c,0) for c in kols),
-                "GIRDILER": b.GIRDILER.replace("KK_TAKIP_","").replace(f"_{T}",""),
-                "AILE": b.AILE, "YARILANMA": b.YARILANMA,
-                "CV_WMAPE": b.CV_WMAPE, "ARA_WMAPE": b.ARA_WMAPE,
-                "ARA_SAPMA": b.ARA_SAPMA, "ARA_POZ": b.ARA_POZ,
-                "BOZULMA_%": b["BOZULMA_%"]})
-FINAL = pd.DataFrame(fin)
-print(FINAL.round(4).to_string(index=False))
+    fin2.append({"MERDIVEN": ad, "bilgi_ay": b_ay,
+                 "erkenlik": CONFIG["HEDEF_OLGUNLASMA_AY"]-b_ay,
+                 "etkin_ay": max(GEREKEN_AY.get(c,0) for c in kols),
+                 "GIRDILER": b.GIRDILER.replace("KK_TAKIP_","").replace(f"_{T}",""),
+                 "AILE": b.AILE, "YARILANMA": b.YARILANMA,
+                 "CV_WMAPE": b.CV_WMAPE, "ARA_WMAPE": b.ARA_WMAPE,
+                 "ARA_SAPMA": b.ARA_SAPMA, "ARA_POZ": b.ARA_POZ,
+                 "ARA_EN_KOTU": b.ARA_EN_KOTU, "elenen": int(X.ELENDI.sum())})
 
-print("\n  ERKENLIK / DOGRULUK (ARA bolgesinde, bagimsiz olcum):")
-for _, r in FINAL.iterrows():
+    print(f"\n  [{ad}]  agirlik CV={w_cv:.2f}/ARA={w_ara:.2f}  elenen={int(X.ELENDI.sum())}/{len(X)}")
+    t = G.head(4).copy()
+    t["GIRDILER"] = t.GIRDILER.str.replace("KK_TAKIP_","").str.replace(f"_{T}","")
+    print(t[["GIRDILER","AILE","CV_WMAPE","ARA_WMAPE","ARA_SAPMA","ARA_POZ",
+             "ARA_EN_KOTU","BIRLESIK2"]].round(4).to_string(index=False))
+
+# ---------------------------------------------------------------- KIYAS
+print("\n" + "=" * 108)
+print("SECIM STRATEJILERININ KARSILASTIRMASI (ARA_WMAPE uzerinden)")
+print("=" * 108)
+K = pd.DataFrame(kiyas)
+print(K.round(4).to_string(index=False))
+print(f"""
+  ORTALAMA ARA_WMAPE:
+    Sadece CV ile secim      : {K.SADECE_CV_ARA_WMAPE.mean():.4f}   <- onceki calismanin yontemi
+    Sabit agirlik (7.4)      : {K.SABIT_AGIRLIK_ARA.mean():.4f}
+    ADAPTIF agirlik (7.6)    : {K.ADAPTIF_ARA.mean():.4f}
+    Sadece ARA ile secim     : {K.SADECE_ARA_ARA_WMAPE.mean():.4f}   <- ust sinir (ARA'ya overfit)
+
+  NOT: 'Sadece ARA' en dusuk cikar ama o da ARA'ya overfit olur — OOT'de bozulur.
+       ADAPTIF, CV'nin guvenilir oldugu yerde CV'yi, olmadigi yerde ARA'yi dinler.
+""")
+
+# ---------------------------------------------------------------- NIHAI
+print("=" * 108)
+print("NIHAI MERDIVEN — OOT'ye gidecek 5 model")
+print("=" * 108)
+FINAL2 = pd.DataFrame(fin2)
+print(FINAL2.round(5).to_string(index=False))
+
+print("\n  ERKENLIK / DOGRULUK:")
+for _, r in FINAL2.iterrows():
     print(f"    {r.MERDIVEN:12s} {int(r.erkenlik):2d} ay erken  "
-          f"CV={r.CV_WMAPE:5.2f} -> ARA={r.ARA_WMAPE:5.2f}  "
-          f"({r['BOZULMA_%']:+6.1f}%)  sapma={r.ARA_SAPMA:+.5f}")
+          f"CV={r.CV_WMAPE:5.2f}  ARA={r.ARA_WMAPE:5.2f}  "
+          f"sapma={r.ARA_SAPMA:+.5f}  poz={r.ARA_POZ}")
 
-print("\n  SECIM DEGISTI MI? (TRAIN sampiyonu vs ARA hakemliginden sonra)")
+print("\n  7.4 -> 7.6 DEGISIKLIKLERI:")
 for ad in MERDIVEN:
-    if ad not in NIHAI_ADAY: continue
-    kaynak = NIHAI[ad] if "NIHAI" in dir() else SONUC[ad]
-    cv1 = kaynak[kaynak.GECERLI].iloc[0]
-    ara1 = NIHAI_ADAY[ad][~NIHAI_ADAY[ad].ARA_ELENDI].iloc[0] \
-           if (~NIHAI_ADAY[ad].ARA_ELENDI).any() else NIHAI_ADAY[ad].iloc[0]
-    degisti = cv1.GIRDILER != ara1.GIRDILER or cv1.AILE != ara1.AILE
-    print(f"    {ad:12s} {'DEGISTI' if degisti else 'ayni'}")
-    if degisti:
-        print(f"        TRAIN : {cv1.GIRDILER[:62]} ({cv1.AILE})")
-        print(f"        ARA   : {ara1.GIRDILER[:62]} ({ara1.AILE})")
+    if ad not in NIHAI_ADAY or ad not in NIHAI_ADAY2: continue
+    e = NIHAI_ADAY[ad][~NIHAI_ADAY[ad].ARA_ELENDI].iloc[0] \
+        if (~NIHAI_ADAY[ad].ARA_ELENDI).any() else NIHAI_ADAY[ad].iloc[0]
+    y = NIHAI_ADAY2[ad][~NIHAI_ADAY2[ad].ELENDI].iloc[0] \
+        if (~NIHAI_ADAY2[ad].ELENDI).any() else NIHAI_ADAY2[ad].iloc[0]
+    if e.GIRDILER != y.GIRDILER or e.AILE != y.AILE:
+        print(f"    {ad:12s} DEGISTI  ARA_WMAPE {e.ARA_WMAPE:.3f} -> {y.ARA_WMAPE:.3f}  "
+              f"| sapma {e.ARA_SAPMA:+.5f} -> {y.ARA_SAPMA:+.5f}")
+        print(f"        once : {e.GIRDILER[:58]} ({e.AILE})")
+        print(f"        simdi: {y.GIRDILER[:58]} ({y.AILE})")
+    else:
+        print(f"    {ad:12s} ayni")
 
 print("\n" + "=" * 108)
-print("BLOK 7 TAMAM — OOT hala DOKUNULMADI.")
-print(f"  Secilen model sayisi: {len(SECILEN)}")
-print(f"  Ortalama CV->ARA bozulmasi: %{FINAL['BOZULMA_%'].mean():.1f}")
-print(f"  (Onceki calismada CV->OOT bozulmasi %61-122 idi)")
+print("BLOK 7.6 TAMAM — OOT hala DOKUNULMADI. Secim KILITLENDI.")
+print(f"  Ortalama ARA_WMAPE : {FINAL2.ARA_WMAPE.mean():.4f}")
+print(f"  Ortalama |sapma|   : {FINAL2.ARA_SAPMA.abs().mean():.5f}  "
+      f"(hedef ort {d.loc[ara_idx,HEDEF].mean():.5f}'in "
+      f"%{100*FINAL2.ARA_SAPMA.abs().mean()/d.loc[ara_idx,HEDEF].mean():.1f}'i)")
 print("=" * 108)
