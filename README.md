@@ -1,331 +1,331 @@
 # ============================================================================
-# BLOK 2 — OZELLIK MUHENDISLIGI VE BOLME
+# BLOK 3 — KESIF, REJIM TESTLERI VE HAVUZ BUDAMA
 #
-# BLOK 1 BULGUSUNA GORE REVIZE EDILDI:
-#   lag-12 hedef otokorelasyonu 0.116 cikti -> HEDEF lag'i zayif.
-#   Yeni strateji: ONCULLERIN gecikmeleri ve yumusatmalari.
-#   Gerekce: 20_2(t-1) kohort t icin t+1'de bilinir -> hem TAZE hem ILISKILI.
+# BU BLOGUN ASIL TESLIMATI: HAVUZ BUDAMA
+#   CHAMPION 89 degisken -> C(89,3)x4x4 = 1.881.104 varyant
+#   Hem calismaz hem FELAKET duzeyde secim yanliligi uretir.
+#   Onceki calismada 9.260 varyanttan secim CV->OOT'de %61 bozulma yaratmisti.
+#   Hedef: havuzu ~25'e indirip varyanti ~37bin'e dusurmek.
 #
-# MERKEZI KAVRAM: "GEREKEN_AY"
-#   Her degisken icin "kohort t acildiktan kac ay sonra bilinir" etiketi.
-#   Champion/Challenger havuzu bu etikete gore filtrelenir.
-#   Bu, sizintinin TEK kaynaginin kapatilmasi demektir.
-#
-# URETILEN AILELER:
-#   A) ONCUL LAG       : X(t-1), X(t-2)        -> seviye hafizasi, cok taze
-#   B) ONCUL YUMUSATMA : 3 aylik hareketli ort -> gurultu azaltma
-#   C) ONCUL MOMENTUM  : X(t) / ort(X(t-1..3)) -> hiz, seviyeden bagimsiz
-#   D) ROLL-RATE       : 60_3/30_3 vb.         -> bozulmanin sertlesme hizi
-#   E) HEDEF LAG       : y(t-9..t-12)          -> zayif ama test edilsin
-#   F) OLCEK TEMIZLEME : limit/adet, goreceli  -> enflasyon trendi kirilir
-#   G) KKB MERKEZLEME + momentum
-#   H) TREND / MEVSIM
+# AYRICA:
+#   3.1  Kayma analizi — PSI yerine KUCUK ORNEKLEME UYGUN metrikler
+#   3.2  Rejim / yapisal kirilma (Chow + kayan pencere)
+#   3.3  Trend ve mevsim: EK KATKI testi (onculden sonra hala anlamli mi?)
+#   3.4  KKB confounding: iliskisi gercek mi, ortak trend mi?
+#   3.5  Korelasyon kumeleme + BUDAMA
 # ============================================================================
+from scipy import stats
+from statsmodels.api import OLS, add_constant
+from statsmodels.stats.outliers_influence import variance_inflation_factor
 
-T = CONFIG["HEDEF_TUR"]
-def K(g, a): return f"KK_TAKIP_{g}_{a}_{T}"
+print("=" * 102)
+print("BLOK 3 — KESIF, REJIM TESTLERI, HAVUZ BUDAMA")
+print("=" * 102)
 
-# GEREKEN_AY kaydi: {kolon_adi: kohort acildiktan kac ay sonra bilinir}
-GEREKEN_AY = {}
+# ---------------------------------------------------------------- 3.1 KAYMA
+# PSI'yi BIRAKTIK. n_ara=6, n_oot=12 -> bin basina <2 gozlem -> bos bin -> sahte PSI~11.
+# Kucuk orneklemde calisan 3 metrik:
+#   z_kayma : (ort_hedef - ort_train) / std_train     -> olcekten bagimsiz seviye kaymasi
+#   disari  : hedefin TRAIN min-max araligi disinda kalan orani -> EKSTRAPOLASYON riski
+#   KS p    : dagilim esitligi testi (kucuk n'de de gecerli)
+print("\n" + "-" * 102)
+print("3.1  DAGILIM KAYMASI (PSI yerine kucuk-orneklem metrikleri)")
+print("-" * 102)
+print("  NOT: Onceki PSI hesabi n=6/12'de BOS BIN urettigi icin sahte ~11 degerler")
+print("       veriyordu. PSI bin basina ~10 gozlem ister; burada uygulanamaz.\n")
 
-def kaydet(ad, seri, gereken_ay, aile):
-    """Yeni degisken uret + ne zaman bilindigini kaydet."""
-    d[ad] = seri
-    GEREKEN_AY[ad] = gereken_ay
-    AILE.setdefault(aile, []).append(ad)
-    return ad
+def kayma(tr_seri, hedef_seri):
+    tr = pd.Series(tr_seri).dropna(); hd = pd.Series(hedef_seri).dropna()
+    if len(tr) < 10 or len(hd) < 3: return dict(z=np.nan, disari=np.nan, ks_p=np.nan)
+    sd = tr.std()
+    return dict(
+        z      = (hd.mean() - tr.mean()) / sd if sd > 0 else np.nan,
+        disari = float(((hd < tr.min()) | (hd > tr.max())).mean()),
+        ks_p   = float(stats.ks_2samp(tr, hd).pvalue))
 
-AILE = {}
-
-print("=" * 100)
-print("BLOK 2 — OZELLIK MUHENDISLIGI")
-print("=" * 100)
-
-# ---------------------------------------------------------------- 2.0 TEMEL
-# Ham onculler: X(t) kohort t'nin {ay}. ayinda olculur -> t+{ay}'da bilinir
-for kod in ONCU_KODLARI:
-    c = oncul_kolon(kod)
-    if c in d.columns:
-        GEREKEN_AY[c] = oncul_ay(kod)
-        AILE.setdefault("0_HAM_ONCUL", []).append(c)
-
-# Ortak alanlar: basvuru aninda bilinir -> 0 ay
-for c in ORTAK_ALANLAR:
-    if c in d.columns:
-        GEREKEN_AY[c] = 0
-        AILE.setdefault("0_ORTAK", []).append(c)
-
-# ---------------------------------------------------------------- 2.1 (A) ONCUL LAG
-# X(t-L) kohort t icin  (t-L)+ay_X  aninda bilinir  ->  gereken = max(0, ay_X - L)
-print("\n" + "-" * 100)
-print("2.1 (A)  ONCUL GECIKMELERI — seviye hafizasi")
-print("-" * 100)
-print("  Mantik: X(t-1) kohort t icin X(t)'den 1 ay ONCE bilinir.")
-print("          Hedefin lag'i zayif (r=0.116) ama oncullerin lag'i taze ve iliskili.\n")
-for kod in ONCU_KODLARI:
-    c = oncul_kolon(kod)
-    if c not in d.columns: continue
-    for L in [1, 2]:
-        ad = f"{c}_L{L}"
-        kaydet(ad, d[c].shift(L), max(0, oncul_ay(kod) - L), "A_ONCUL_LAG")
-print(f"  Uretildi: {len(AILE.get('A_ONCUL_LAG', []))} degisken")
-print(f"  Ornek   : {K(20,2)}_L1  ->  gereken_ay = {GEREKEN_AY.get(K(20,2)+'_L1')}")
-
-# ---------------------------------------------------------------- 2.2 (B) YUMUSATMA
-print("\n" + "-" * 100)
-print("2.2 (B)  ONCUL YUMUSATMA — 3 aylik hareketli ortalama")
-print("-" * 100)
-print("  Tek ayin oranı gurultulu (BASVURU_ADEDI 44bin-291bin arasi oynuyor).")
-print("  3 kohortluk ortalama seviyeyi daha istikrarli olcer.\n")
-for kod in ONCU_KODLARI:
-    c = oncul_kolon(kod)
-    if c not in d.columns: continue
-    # t, t-1, t-2'nin ortalamasi -> en gec bilinen X(t) -> gereken = ay_X
-    kaydet(f"{c}_MA3", d[c].rolling(3, min_periods=3).mean(),
-           oncul_ay(kod), "B_YUMUSATMA")
-    # t-1, t-2, t-3 (gecmise kaydirilmis) -> gereken = max(0, ay_X - 1)
-    kaydet(f"{c}_MA3L1", d[c].shift(1).rolling(3, min_periods=3).mean(),
-           max(0, oncul_ay(kod) - 1), "B_YUMUSATMA")
-print(f"  Uretildi: {len(AILE.get('B_YUMUSATMA', []))} degisken")
-
-# ---------------------------------------------------------------- 2.3 (C) MOMENTUM
-print("\n" + "-" * 100)
-print("2.3 (C)  ONCUL MOMENTUM — seviyeden bagimsiz hiz")
-print("-" * 100)
-print("  X(t) / ort(X(t-1..t-3)) : 'bu kohort gecmis 3 kohorta gore nerede?'")
-print("  Olcekten bagimsiz, enflasyon/trend tasimaz.\n")
-for kod in ONCU_KODLARI:
-    c = oncul_kolon(kod)
-    if c not in d.columns: continue
-    gecmis = d[c].shift(1).rolling(3, min_periods=3).mean()
-    kaydet(f"{c}_MOM", d[c] / gecmis.replace(0, np.nan),
-           oncul_ay(kod), "C_MOMENTUM")
-print(f"  Uretildi: {len(AILE.get('C_MOMENTUM', []))} degisken")
-
-# ---------------------------------------------------------------- 2.4 (D) ROLL-RATE
-print("\n" + "-" * 100)
-print("2.4 (D)  ROLL-RATE — bozulmanin sertlesme hizi")
-print("-" * 100)
-print("  60_3/30_3 : '30+ olanlarin ne kadari 60+'a ilerledi?'")
-print("  VIF dusurur (20_2 ile 60_3 korelasyonu 0.88 idi) ve IS ANLAMI tasir.\n")
-RR = [("RR_30_60_M3", 60, 3, 30, 3), ("RR_30_60_M4", 60, 4, 30, 4),
-      ("RR_30_60_M5", 60, 5, 30, 5), ("RR_30_60_M6", 60, 6, 30, 6),
-      ("RR_20_30_M2", 30, 2, 20, 2)]
-for ad, gu, au, ga, aa in RR:
-    cu, ca = K(gu, au), K(ga, aa)
-    if cu in d.columns and ca in d.columns:
-        kaydet(ad, d[cu] / d[ca].replace(0, np.nan), max(au, aa), "D_ROLLRATE")
-# Aylar arasi gecis: 3. aydaki 60+ / 2. aydaki 30+
-if K(60,3) in d.columns and K(30,2) in d.columns:
-    kaydet("RR_M2_30_M3_60", d[K(60,3)] / d[K(30,2)].replace(0, np.nan), 3, "D_ROLLRATE")
-print(f"  Uretildi: {len(AILE.get('D_ROLLRATE', []))} degisken")
-
-# ---------------------------------------------------------------- 2.5 (E) HEDEF LAG
-print("\n" + "-" * 100)
-print("2.5 (E)  HEDEF GECIKMELERI — zayif ama test edilsin")
-print("-" * 100)
-print(f"  BLOK 1 bulgusu: lag-12 otokorelasyon = +0.116 (zayif).")
-print(f"  Yine de grid karar versin; lag ortalamasi tek lag'den istikrarli olabilir.")
-print(f"  Sizinti sarti: y(t-L) kohort t icin (t-L)+12'de bilinir -> gereken = max(0, 12-L)\n")
-if CONFIG["LAG_KULLAN"]:
-    for L in [9, 10, 11, 12]:
-        kaydet(f"HEDEF_L{L}", d[HEDEF].shift(L),
-               max(0, CONFIG["HEDEF_OLGUNLASMA_AY"] + CONFIG["RAPOR_GECIKME_AY"] - L),
-               "E_HEDEF_LAG")
-    # 4 lag'in ortalamasi: en gec bilinen y(t-9) -> gereken = 3
-    kaydet("HEDEF_L9_12_ORT",
-           pd.concat([d[f"HEDEF_L{L}"] for L in [9,10,11,12]], axis=1).mean(axis=1),
-           3, "E_HEDEF_LAG")
-    for L in [9, 10, 11, 12]:
-        r = d[[f"HEDEF_L{L}", HEDEF]].dropna().corr().iloc[0,1]
-        print(f"    HEDEF_L{L:<2d}  gereken_ay={GEREKEN_AY[f'HEDEF_L{L}']}  r(hedef)={r:+.3f}")
-    r = d[["HEDEF_L9_12_ORT", HEDEF]].dropna().corr().iloc[0,1]
-    print(f"    HEDEF_L9_12_ORT gereken_ay=3  r(hedef)={r:+.3f}   <-- ortalama daha iyi mi?")
-
-# ---------------------------------------------------------------- 2.6 (F) OLCEK
-print("\n" + "-" * 100)
-print("2.6 (F)  OLCEK TEMIZLEME — enflasyon trendini kir")
-print("-" * 100)
-print(f"  TOPLAM_ONAYLANAN_LIMIT: 3.41e8 -> 1.05e10 = 31 KAT artis, CV=%70.3")
-print(f"  Ham haliyle modele girerse SAF ZAMAN TRENDI proxy'si olur.")
-print(f"  Cozum: adet basina + kendi gecmisine goreceli hale getir.\n")
-if {"TOPLAM_ONAYLANAN_LIMIT", "BASVURU_ADEDI"} <= set(d.columns):
-    ort_lim = d["TOPLAM_ONAYLANAN_LIMIT"] / d["BASVURU_ADEDI"].replace(0, np.nan)
-    kaydet("ORT_ONAY_LIMIT", ort_lim, 0, "F_OLCEK")
-    # Goreceli: kendi 12 aylik gecmisine oran -> olcek ve enflasyon notr
-    kaydet("LIMIT_GORECELI",
-           ort_lim / ort_lim.shift(1).rolling(12, min_periods=6).mean().replace(0, np.nan),
-           0, "F_OLCEK")
-    kaydet("ADET_GORECELI",
-           d["BASVURU_ADEDI"] / d["BASVURU_ADEDI"].shift(1)
-             .rolling(12, min_periods=6).mean().replace(0, np.nan),
-           0, "F_OLCEK")
-    kaydet("LOG_ADET", np.log(d["BASVURU_ADEDI"].replace(0, np.nan)), 0, "F_OLCEK")
-    for c in ["ORT_ONAY_LIMIT", "LIMIT_GORECELI", "ADET_GORECELI"]:
-        print(f"    {c:18s} CV=%{100*d[c].std()/d[c].mean():5.1f}  "
-              f"ilk12={d[c].head(12).mean():.4g}  son12={d[c].tail(12).mean():.4g}")
-    print(f"\n  >> LIMIT_GORECELI'nin CV'si ham limitten cok daha dusukse, trend kirilmistir.")
-
-# ---------------------------------------------------------------- 2.7 (G) KKB
-print("\n" + "-" * 100)
-print("2.7 (G)  KKB MERKEZLEME VE MOMENTUM")
-print("-" * 100)
-if "KKB_SKOR_O0120" in d.columns:
-    tr_mask = d[DONEM_KOL].astype(int).between(*CONFIG["TRAIN_ARALIK"]) & d.HEDEF_KULLANILABILIR
-    KKB_REF = float(d.loc[tr_mask, "KKB_SKOR_O0120"].mean())   # SADECE train ortalamasi!
-    print(f"  Merkezleme referansi (TRAIN ortalamasi): {KKB_REF:.2f}")
-    print(f"  !! Tum veri ortalamasi kullanilsaydi OOT bilgisi sizardi. Train'den aliniyor.")
-    if CONFIG["KKB_MERKEZLE"]:
-        kaydet("KKB_MERKEZ", d["KKB_SKOR_O0120"] - KKB_REF, 0, "G_KKB")
-        print(f"\n  Eski formul: 12M90 = 0.0447 + ... - 2.92e-05*KKB")
-        print(f"               sabit terim hedefin 2.9 kati, KKB terimi onu kesiyordu.")
-        print(f"  Yeni       : sabit terim = 'ortalama KKB'de beklenen 12M90' -> yorumlanabilir.")
-    # KKB momentum: portfoy kalitesi iyilesiyor mu kotulesiyor mu
-    kaydet("KKB_MOM", d["KKB_SKOR_O0120"] /
-           d["KKB_SKOR_O0120"].shift(1).rolling(6, min_periods=3).mean().replace(0, np.nan),
-           0, "G_KKB")
-    kaydet("KKB_DEGISIM", d["KKB_SKOR_O0120"].diff(), 0, "G_KKB")
-if "KALIBRE_PD_AGIRLIKLI" in d.columns:
-    kaydet("PD_MOM", d["KALIBRE_PD_AGIRLIKLI"] /
-           d["KALIBRE_PD_AGIRLIKLI"].shift(1).rolling(6, min_periods=3).mean().replace(0, np.nan),
-           0, "G_KKB")
-
-# ---------------------------------------------------------------- 2.8 (H) TREND/MEVSIM
-print("\n" + "-" * 100)
-print("2.8 (H)  TREND VE MEVSIM")
-print("-" * 100)
-d["TREND_IDX"] = (d["AY"].astype("int64") - d["AY"].astype("int64").min()).astype(float)
-_ay = d["AY"].dt.month
-d["SIN_AY"]  = np.sin(2*np.pi*_ay/12);  d["COS_AY"]  = np.cos(2*np.pi*_ay/12)
-d["SIN_AY2"] = np.sin(4*np.pi*_ay/12);  d["COS_AY2"] = np.cos(4*np.pi*_ay/12)
-for c in ["TREND_IDX", "SIN_AY", "COS_AY", "SIN_AY2", "COS_AY2"]:
-    GEREKEN_AY[c] = 0
-print("  TREND_IDX uretildi — DIKKAT: gelecege dogrusal ekstrapole eder.")
-print("  Onceki calismada hic secilmedi; sans eseri felaket onlendi.")
-print(f"  lag-12 otokorelasyon 0.116 -> 12 AYLIK DONGU YOK. Mevsim beklentisi dusuk.")
-
-# ---------------------------------------------------------------- 2.9 HAVUZLAR
-print("\n" + "-" * 100)
-print("2.9  HAVUZ OLUSTURMA (GEREKEN_AY filtresiyle)")
-print("-" * 100)
-TUM_ADAY = [c for c in GEREKEN_AY if c in d.columns and c != HEDEF]
-# 90+ yasagi (guvenlik agi)
-TUM_ADAY = [c for c in TUM_ADAY if f"_90_" not in c or c.startswith("HEDEF_L")]
-
-CHAMPION_HAVUZ   = sorted([c for c in TUM_ADAY if GEREKEN_AY[c] <= CONFIG["SON_ONCU_AY"]])
-CHALLENGER_HAVUZ = sorted([c for c in TUM_ADAY if GEREKEN_AY[c] <= CONFIG["CHALLENGER_MAX_AY"]])
-
-ozet = pd.DataFrame([{"aile": a, "adet": len(v),
-                      "champion": sum(GEREKEN_AY[c] <= CONFIG["SON_ONCU_AY"] for c in v),
-                      "challenger": sum(GEREKEN_AY[c] <= CONFIG["CHALLENGER_MAX_AY"] for c in v)}
-                     for a, v in sorted(AILE.items())])
-print(ozet.to_string(index=False))
-print(f"\n  CHAMPION_HAVUZ   (<= {CONFIG['SON_ONCU_AY']} ay) : {len(CHAMPION_HAVUZ)} degisken")
-print(f"  CHALLENGER_HAVUZ (<= {CONFIG['CHALLENGER_MAX_AY']} ay) : {len(CHALLENGER_HAVUZ)} degisken")
-
-print("\n  GEREKEN_AY dagilimi (challenger havuzu):")
-_g = pd.Series({c: GEREKEN_AY[c] for c in CHALLENGER_HAVUZ}).value_counts().sort_index()
-for k, v in _g.items():
-    print(f"    {k} ay bekleme : {v:3d} degisken")
-
-# ---------------------------------------------------------------- 2.10 NaN
-print("\n" + "-" * 100)
-print("2.10  NaN DENETIMI (rolling/shift ilk satirlarda NaN uretir)")
-print("-" * 100)
-nan_say = d[TUM_ADAY].isna().sum()
-nanli = nan_say[nan_say > 0].sort_values(ascending=False)
-print(f"  NaN ureten degisken: {len(nanli)} / {len(TUM_ADAY)}")
-if len(nanli):
-    print(f"  En cok NaN: {dict(nanli.head(5))}")
-ilk_tam = d[TUM_ADAY].notna().all(axis=1).idxmax()
-print(f"  Tum degiskenlerin dolu oldugu ILK satir: index={ilk_tam}  "
-      f"donem={d.loc[ilk_tam, DONEM_KOL]}")
-print(f"  -> Bu donemden onceki {ilk_tam} kohort, TAM havuzla modellemede kullanilamaz.")
-print(f"  -> Ama grid her kombinasyonu AYRI dropna ile isler; kucuk setler daha cok satir kullanir.")
-
-# ---------------------------------------------------------------- 2.11 BOLME
-print("\n" + "-" * 100)
-print("2.11  TRAIN / ARA / OOT BOLMESI")
-print("-" * 100)
-dn = d[DONEM_KOL].astype(int)
-d["BOLGE"] = np.where(dn.between(*CONFIG["TRAIN_ARALIK"]), "TRAIN",
-              np.where(dn.between(*CONFIG["ARA_ARALIK"]),   "ARA",
-              np.where(dn.between(*CONFIG["OOT_ARALIK"]),   "OOT", "TAHMIN")))
-d.loc[~d.HEDEF_KULLANILABILIR, "BOLGE"] = "TAHMIN"
-
-tr_idx  = d.index[(d.BOLGE == "TRAIN")].to_numpy()
-ara_idx = d.index[(d.BOLGE == "ARA")].to_numpy()
-oot_idx = d.index[(d.BOLGE == "OOT")].to_numpy()
-tah_idx = d.index[(d.BOLGE == "TAHMIN")].to_numpy()
-
-b = d.groupby("BOLGE").agg(n=(DONEM_KOL, "count"), bas=(DONEM_KOL, "min"),
-                           son=(DONEM_KOL, "max"), hedef_ort=(HEDEF, "mean"),
-                           hedef_min=(HEDEF, "min"), hedef_max=(HEDEF, "max")
-                          ).reindex(["TRAIN", "ARA", "OOT", "TAHMIN"])
-print(b.round(5).to_string())
-print(f"\n  TRAIN : grid + Optuna SADECE burada")
-print(f"  ARA   : BLOK 7 hakemligi — ilk {CONFIG['ARA_ADAY_N']} aday burada elenecek")
-print(f"  OOT   : KILITLI, BLOK 8'de tek seferde acilacak")
-
-# ---------------------------------------------------------------- 2.12 PSI
-print("\n" + "-" * 100)
-print("2.12  PSI — dagilim kaymasi (TRAIN referans)")
-print("-" * 100)
-def psi(bek, goz, bins=6):
-    bek, goz = pd.Series(bek).dropna(), pd.Series(goz).dropna()
-    if len(bek) < 10 or len(goz) < 3: return np.nan
-    kes = np.unique(np.percentile(bek, np.linspace(0, 100, bins+1)))
-    if len(kes) < 3: return np.nan
-    kes[0], kes[-1] = -np.inf, np.inf
-    e = np.clip(np.histogram(bek, kes)[0] / len(bek), 1e-6, None)
-    a = np.clip(np.histogram(goz, kes)[0] / len(goz), 1e-6, None)
-    return float(np.sum((a - e) * np.log(a / e)))
-
-ps = []
+ky = []
 for c in [HEDEF] + CHAMPION_HAVUZ:
-    ps.append({"degisken": c, "gereken_ay": GEREKEN_AY.get(c, 0),
-               "PSI_ARA": psi(d.loc[tr_idx, c], d.loc[ara_idx, c]),
-               "PSI_OOT": psi(d.loc[tr_idx, c], d.loc[oot_idx, c])})
-ps = pd.DataFrame(ps)
-ps["durum"] = np.where(ps.PSI_OOT < 0.10, "OK",
-               np.where(ps.PSI_OOT < 0.25, "ORTA", "CIDDI"))
-print("  (PSI<0.10 kayma yok | 0.10-0.25 orta | >0.25 CIDDI)\n")
+    a = kayma(d.loc[tr_idx, c], d.loc[ara_idx, c])
+    o = kayma(d.loc[tr_idx, c], d.loc[oot_idx, c])
+    ky.append({"degisken": c, "gereken_ay": GEREKEN_AY.get(c, 0),
+               "z_ARA": a["z"], "z_OOT": o["z"],
+               "disari_OOT": o["disari"], "KS_p_OOT": o["ks_p"]})
+ky = pd.DataFrame(ky)
+ky["durum"] = np.where(ky.z_OOT.abs() < 0.75, "OK",
+               np.where(ky.z_OOT.abs() < 1.75, "ORTA", "CIDDI"))
+print("  (|z|<0.75 OK | 0.75-1.75 ORTA | >1.75 CIDDI)")
+print("  disari_OOT: OOT degerlerinin TRAIN araligi disinda kalan orani -> ekstrapolasyon\n")
 print("  EN COK KAYAN 15:")
-print(ps.sort_values("PSI_OOT", ascending=False).head(15).round(4).to_string(index=False))
-print(f"\n  Durum dagilimi: {dict(ps.durum.value_counts())}")
-print(f"  >> 'CIDDI' isaretli degiskenler OOT'de bozulur. BLOK 5'te ceza uygulanacak.")
+print(ky.reindex(ky.z_OOT.abs().sort_values(ascending=False).index)
+        .head(15).round(3).to_string(index=False))
+print(f"\n  Durum dagilimi: {dict(ky.durum.value_counts())}")
+_h = ky[ky.degisken == HEDEF].iloc[0]
+print(f"  HEDEFin kendi kaymasi: z_OOT={_h.z_OOT:+.3f}  disari={_h.disari_OOT:.2f}")
+print(f"  >> Hedef z pozitifse OOT donemi TRAIN'den YUKSEK seviyede demektir.")
 
-CIDDI_KAYAN = ps[ps.durum == "CIDDI"].degisken.tolist()
-if CIDDI_KAYAN:
-    print(f"  >> CIDDI kayanlar: {CIDDI_KAYAN[:10]}")
+KAYAN = set(ky[ky.durum == "CIDDI"].degisken) - {HEDEF}
+print(f"  >> CIDDI kayan {len(KAYAN)} degisken budamada cezalandirilacak.")
 
-# ---------------------------------------------------------------- 2.13 ON ELEME
-print("\n" + "-" * 100)
-print("2.13  TEK DEGISKENLI ON TARAMA (TRAIN'de)")
-print("-" * 100)
-from scipy.stats import pearsonr, spearmanr
-tr_ok = d.loc[tr_idx]
-rows = []
-for c in CHAMPION_HAVUZ:
-    sub = tr_ok[[c, HEDEF]].dropna()
-    if len(sub) < 15: continue
-    r, _   = pearsonr(sub[c], sub[HEDEF])
-    rho, _ = spearmanr(sub[c], sub[HEDEF])
-    rows.append({"degisken": c, "gereken_ay": GEREKEN_AY[c], "n": len(sub),
-                 "Pearson": r, "r2": r**2, "Spearman": rho, "S-P": rho - r,
-                 "PSI_OOT": ps.set_index("degisken").PSI_OOT.get(c, np.nan)})
-tek = pd.DataFrame(rows).sort_values("r2", ascending=False)
-print("  EN GUCLU 20 (TRAIN):")
-print(tek.head(20).round(4).to_string(index=False))
+# ---------------------------------------------------------------- 3.2 REJIM
+print("\n" + "-" * 102)
+print("3.2  REJIM / YAPISAL KIRILMA")
+print("-" * 102)
+olg = d[d.HEDEF_KULLANILABILIR].copy().reset_index(drop=True)
+REF = K(60, 3) if K(60, 3) in d.columns else K(30, 2)
+olg["_k"] = olg[HEDEF] / olg[REF].replace(0, np.nan)
 
-print("\n  CHALLENGER havuzundan (<=3 ay) EN GUCLU 12:")
-print(tek[tek.gereken_ay <= CONFIG["CHALLENGER_MAX_AY"]].head(12).round(4).to_string(index=False))
+print(f"  Referans oncul: {REF}")
+print(f"  Carpan k = hedef/{REF}: ort={olg._k.mean():.3f} std={olg._k.std():.3f} "
+      f"CV=%{100*olg._k.std()/olg._k.mean():.1f}")
 
-print("\n  >> |S-P| > 0.10 olanlar: egrilik/aykiri deger var, dikkat")
-egri = tek[tek["S-P"].abs() > 0.10]
-print(f"     {len(egri)} degisken: {egri.degisken.head(6).tolist()}")
+def chow(df, x, y, i):
+    n, kk = len(df), 2
+    X = add_constant(df[[x]].values); Y = df[y].values
+    if i <= kk + 2 or n - i <= kk + 2: return np.nan, np.nan
+    rp = OLS(Y, X).fit().ssr
+    r1 = OLS(Y[:i], X[:i]).fit().ssr; r2 = OLS(Y[i:], X[i:]).fit().ssr
+    F = ((rp - (r1 + r2)) / kk) / ((r1 + r2) / (n - 2*kk))
+    return F, 1 - stats.f.cdf(F, kk, n - 2*kk)
 
-print("=" * 100)
-print(f"BLOK 2 TAMAM — {len(TUM_ADAY)} aday degisken uretildi.")
-print(f"  CHAMPION {len(CHAMPION_HAVUZ)} | CHALLENGER {len(CHALLENGER_HAVUZ)}")
-print("=" * 100)
+ch = []
+for i in range(8, len(olg) - 8):
+    F, p = chow(olg, REF, HEDEF, i)
+    ch.append({"idx": i, "DONEM": olg[DONEM_KOL].iloc[i], "F": F, "p": p})
+ch = pd.DataFrame(ch)
+print(f"\n  CHOW TESTI — en guclu 6 kirilma noktasi:")
+print(ch.nlargest(6, "F").round(4).to_string(index=False))
+kritik_F = stats.f.ppf(0.95, 2, len(olg) - 4)
+print(f"  %95 kritik F = {kritik_F:.3f}")
+print(f"  >> F > kritik olan donemler yapisal kirilma. TRAIN bolgesinin ICINDE")
+print(f"     kirilma varsa, model iki farkli rejimi birlikte ogrenmeye calisiyor.")
+
+W = 12
+kay = []
+for i in range(len(olg) - W + 1):
+    w = olg.iloc[i:i+W]
+    kay.append({"pencere": f"{w[DONEM_KOL].iloc[0]}-{w[DONEM_KOL].iloc[-1]}",
+                "k_ort": w._k.mean(),
+                "egim": OLS(w[HEDEF], add_constant(w[[REF]])).fit().params.iloc[1]})
+kay = pd.DataFrame(kay)
+print(f"\n  KAYAN PENCERE (12 ay):")
+print(f"    carpan k : CV=%{100*kay.k_ort.std()/kay.k_ort.mean():.1f}  "
+      f"aralik=[{kay.k_ort.min():.2f}, {kay.k_ort.max():.2f}]")
+print(f"    egim     : CV=%{100*kay.egim.std()/kay.egim.mean():.1f}  "
+      f"aralik=[{kay.egim.min():.2f}, {kay.egim.max():.2f}]")
+print(f"  >> Carpanin CV'si egimin CV'sinden DUSUKSE, sabit terimsiz (oransal)")
+print(f"     model daha saglamdir. Bunu BLOK 5'te ayri bir aday olarak test edecegiz.")
+
+# ---------------------------------------------------------------- 3.3 TREND/MEVSIM
+print("\n" + "-" * 102)
+print("3.3  TREND VE MEVSIM — EK KATKI TESTI")
+print("-" * 102)
+print("  Dogru soru 'mevsim var mi' degil, 'ONCUL kontrol edildikten SONRA hala")
+print("  anlamli mi'. Cunku mevsimsellik zaten oncule yansimis olabilir (cifte sayma).\n")
+EN_IYI = tek.iloc[0]["degisken"]
+tr_ok = d.loc[tr_idx].dropna(subset=[EN_IYI, HEDEF])
+print(f"  Kontrol degiskeni: {EN_IYI} (TRAIN'de en guclu, r2={tek.iloc[0]['r2']:.3f})")
+
+def ek_katki(taban, ek, ad):
+    X0 = add_constant(tr_ok[taban]); X1 = add_constant(tr_ok[taban + ek])
+    m0, m1 = OLS(tr_ok[HEDEF], X0).fit(), OLS(tr_ok[HEDEF], X1).fit()
+    F = ((m0.ssr - m1.ssr) / len(ek)) / (m1.ssr / m1.df_resid)
+    p = 1 - stats.f.cdf(F, len(ek), m1.df_resid)
+    print(f"  {ad:34s} R2 {m0.rsquared:.4f} -> {m1.rsquared:.4f}  "
+          f"F={F:6.3f}  p={p:.4f}  {'>>> EKLE' if p < 0.05 else 'ekleme'}")
+    return p
+
+p_tr = ek_katki([EN_IYI], ["TREND_IDX"],            "+ TREND")
+p_ms = ek_katki([EN_IYI], ["SIN_AY", "COS_AY"],     "+ MEVSIM (1. harmonik)")
+p_m2 = ek_katki([EN_IYI], ["SIN_AY","COS_AY","SIN_AY2","COS_AY2"], "+ MEVSIM (2 harmonik)")
+print(f"\n  BLOK 1: lag-12 otokorelasyon = +0.116 -> 12 aylik dongu YOK.")
+print(f"  Bu test de ayni sonucu verirse, mevsim varyantlari GRID'DEN CIKARILMALI")
+print(f"  (arama uzayini 4 kat kuculturur, secim yanliligini azaltir).")
+
+CONFIG["TREND_DENE"]  = bool(p_tr < 0.05)
+CONFIG["MEVSIM_DENE"] = bool(p_ms < 0.05 or p_m2 < 0.05)
+print(f"\n  -> CONFIG guncellendi: TREND_DENE={CONFIG['TREND_DENE']}  "
+      f"MEVSIM_DENE={CONFIG['MEVSIM_DENE']}")
+
+# ---------------------------------------------------------------- 3.4 KKB
+print("\n" + "-" * 102)
+print("3.4  KKB CONFOUNDING TESTI")
+print("-" * 102)
+print("  BLOK 1: KKB ilk12=1415.4 -> son12=1368.0  (-47.4 puan = 1.26 std)")
+print("  Hedef de 2023'te zirve yapip dustu. Korelasyonun ne kadari GERCEK?\n")
+if "KKB_SKOR_O0120" in d.columns:
+    s = d.loc[tr_idx].dropna(subset=["KKB_SKOR_O0120", HEDEF, EN_IYI, "TREND_IDX"])
+    r_ham, _ = stats.pearsonr(s["KKB_SKOR_O0120"], s[HEDEF])
+    print(f"  Ham korelasyon  KKB ~ hedef        : {r_ham:+.4f}")
+
+    def kismi(x, y, kontrol):
+        rx = OLS(s[x], add_constant(s[kontrol])).fit().resid
+        ry = OLS(s[y], add_constant(s[kontrol])).fit().resid
+        return stats.pearsonr(rx, ry)
+
+    for kon, ad in [(["TREND_IDX"], "TREND kontrol edilince"),
+                    ([EN_IYI], f"{EN_IYI[:22]} kontrol edilince"),
+                    ([EN_IYI, "TREND_IDX"], "IKISI birden kontrol")]:
+        rr, pp = kismi("KKB_SKOR_O0120", HEDEF, kon)
+        print(f"  Kismi korelasyon {ad:36s}: {rr:+.4f}  (p={pp:.4f})")
+    print(f"\n  >> Kismi korelasyon ~0'a dusuyorsa KKB'nin katkisi BAGIMSIZ DEGIL;")
+    print(f"     ya zaman trendini ya da oncul bilgisini tekrarliyor.")
+    print(f"  >> Anlamli kalirsa KKB gercek ek bilgi tasiyor, havuzda kalmali.")
+
+# ---------------------------------------------------------------- 3.5 BUDAMA
+print("\n" + "-" * 102)
+print("3.5  HAVUZ BUDAMA  (bu blogun asil teslimati)")
+print("-" * 102)
+nc = len(CHAMPION_HAVUZ)
+from math import comb
+eski = sum(comb(nc, k) for k in range(1, CONFIG["MAX_K"]+1)) * 4 * len(CONFIG["MODEL_AILELERI"])
+print(f"  MEVCUT: CHAMPION {nc} degisken -> {eski:,} varyant")
+print(f"  Onceki calismada 9.260 varyanttan secim CV->OOT'de %61 bozulma yaratmisti.")
+print(f"  Hedef: havuzu ~25'e indir, varyanti ~37bin'e dusur.\n")
+
+print("  BUDAMA KURALLARI:")
+print("   K1  Minimum guc     : TRAIN r2 >= 0.35")
+print("   K2  Yeterli gozlem  : n >= 30 (NaN uretenler elenir)")
+print("   K3  Kayma cezasi    : |z_OOT| > 1.75 olanlar elenir (ekstrapolasyon riski)")
+print("   K4  Tekrar temizligi: aralarinda |r| > 0.95 olanlardan SADECE EN GUCLUSU kalir")
+print("   K5  Aile kotasi     : her aileden en fazla 4 degisken")
+print("   K6  Olgunluk cesitliligi: her GEREKEN_AY seviyesinden en az 2 temsilci\n")
+
+ad_bilgi = tek.set_index("degisken")
+kayma_z  = ky.set_index("degisken").z_OOT.abs()
+
+def buda(havuz, maks_ay, etiket, hedef_boyut=25):
+    # K1 + K2 + K3
+    aday = []
+    for c in havuz:
+        if c not in ad_bilgi.index: continue
+        b = ad_bilgi.loc[c]
+        if b["r2"] < 0.35 or b["n"] < 30: continue
+        if kayma_z.get(c, 0) > 1.75: continue
+        aday.append((c, float(b["r2"])))
+    aday.sort(key=lambda t: -t[1])
+    print(f"  [{etiket}] K1-K3 sonrasi: {len(aday)} / {len(havuz)}")
+
+    # K4: tekrar temizligi (greedy, en gucluden basla)
+    kor = d.loc[tr_idx, [c for c, _ in aday]].corr().abs()
+    secili, aile_say = [], {}
+    def hangi_aile(c):
+        for a, v in AILE.items():
+            if c in v: return a
+        return "?"
+    for c, r2 in aday:
+        if any(kor.loc[c, s] > 0.95 for s in secili):   # K4
+            continue
+        a = hangi_aile(c)
+        if aile_say.get(a, 0) >= 4:                     # K5
+            continue
+        secili.append(c); aile_say[a] = aile_say.get(a, 0) + 1
+        if len(secili) >= hedef_boyut: break
+
+    # K6: olgunluk cesitliligi — her seviyeden en az 2
+    for ay in sorted({GEREKEN_AY[c] for c in havuz if GEREKEN_AY[c] <= maks_ay}):
+        var = [c for c in secili if GEREKEN_AY[c] == ay]
+        if len(var) >= 2: continue
+        ek = [c for c, _ in aday if GEREKEN_AY[c] == ay and c not in secili]
+        for c in ek[:2 - len(var)]:
+            secili.append(c)
+    print(f"  [{etiket}] BUDANMIS: {len(secili)} degisken  (aile dagilimi: {aile_say})")
+    return secili
+
+CHAMPION_BUDANMIS   = buda(CHAMPION_HAVUZ,   CONFIG["SON_ONCU_AY"],       "CHAMPION",   25)
+CHALLENGER_BUDANMIS = buda(CHALLENGER_HAVUZ, CONFIG["CHALLENGER_MAX_AY"], "CHALLENGER", 20)
+
+for ad, hv in [("CHAMPION", CHAMPION_BUDANMIS), ("CHALLENGER", CHALLENGER_BUDANMIS)]:
+    t = pd.DataFrame({"degisken": hv})
+    t["gereken_ay"] = t.degisken.map(GEREKEN_AY)
+    t["r2"]         = t.degisken.map(ad_bilgi.r2)
+    t["z_OOT"]      = t.degisken.map(ky.set_index("degisken").z_OOT)
+    print(f"\n  === {ad} BUDANMIS HAVUZ ({len(hv)}) ===")
+    print(t.sort_values(["gereken_ay", "r2"], ascending=[True, False]).round(3).to_string(index=False))
+
+n2 = len(CHAMPION_BUDANMIS)
+vary = 1 + int(CONFIG["TREND_DENE"]) + int(CONFIG["MEVSIM_DENE"]) + \
+       int(CONFIG["TREND_DENE"] and CONFIG["MEVSIM_DENE"])
+yeni = sum(comb(n2, k) for k in range(1, CONFIG["MAX_K"]+1)) * vary * len(CONFIG["MODEL_AILELERI"])
+print(f"\n  VARYANT SAYISI: {eski:,}  ->  {yeni:,}   ({100*(1-yeni/eski):.1f}% azalma)")
+print(f"  >> Secim yanliligi bu oranda azalir. BLOK 7 hakemligi kalani temizleyecek.")
+
+# ---------------------------------------------------------------- 3.6 VIF
+print("\n" + "-" * 102)
+print("3.6  VIF — BUDANMIS HAVUZDA")
+print("-" * 102)
+for ad, hv in [("CHAMPION", CHAMPION_BUDANMIS), ("CHALLENGER", CHALLENGER_BUDANMIS)]:
+    sub = d.loc[tr_idx, hv].dropna()
+    if len(sub) <= len(hv) + 2:
+        print(f"  [{ad}] n={len(sub)} <= p={len(hv)}: tam havuz VIF'i hesaplanamaz (beklenen).")
+        print(f"         Grid zaten en fazla K={CONFIG['MAX_K']} degisken kullanacak.")
+        continue
+    X = add_constant(sub, has_constant="add")
+    v = pd.DataFrame({"degisken": X.columns,
+                      "VIF": [variance_inflation_factor(X.values, i) for i in range(X.shape[1])]})
+    v = v[v.degisken != "const"].sort_values("VIF", ascending=False)
+    print(f"\n  [{ad}] en yuksek 8 VIF:")
+    print(v.head(8).round(2).to_string(index=False))
+
+# ---------------------------------------------------------------- 3.7 GORSEL
+print("\n" + "-" * 102)
+print("3.7  GORSELLESTIRME")
+print("-" * 102)
+fig, ax = plt.subplots(2, 3, figsize=(17, 9))
+fig.suptitle("BLOK 3 — Kesif Paneli", fontsize=13, fontweight="bold")
+
+bg = {"TRAIN": RENK["tr"], "ARA": RENK["ara"], "OOT": RENK["oot"], "TAHMIN": RENK["gri"]}
+for b_, g in d.groupby("BOLGE"):
+    ax[0,0].scatter(g["AY"].dt.to_timestamp(), g[HEDEF]*100, s=30, color=bg[b_], label=b_)
+ax[0,0].plot(d["AY"].dt.to_timestamp(), d[HEDEF]*100, "-", color=RENK["gri"], lw=.8, zorder=0)
+ax[0,0].set_title("Hedef + bolgeler"); ax[0,0].legend(fontsize=7); ax[0,0].set_ylabel("%")
+ax[0,0].tick_params(axis="x", rotation=45, labelsize=7)
+
+ax[0,1].plot(ch.DONEM, ch.F, "-", color=RENK["tah"], lw=1.5)
+ax[0,1].axhline(kritik_F, color=RENK["gri"], ls="--", label="%95 kritik")
+ax[0,1].set_title("Chow F — kirilma noktasi"); ax[0,1].legend(fontsize=7)
+ax[0,1].tick_params(axis="x", rotation=90, labelsize=6)
+
+ax[0,2].plot(range(len(kay)), kay.k_ort, "o-", color=RENK["oot"], ms=3)
+ax[0,2].set_title(f"Kayan carpan (12 ay)\nCV=%{100*kay.k_ort.std()/kay.k_ort.mean():.1f}")
+ax[0,2].set_xticks(range(0, len(kay), 5))
+ax[0,2].set_xticklabels(kay.pencere[::5], rotation=90, fontsize=6)
+
+tt = tek[tek.degisken.isin(CHAMPION_BUDANMIS)].sort_values("r2").tail(18)
+ax[1,0].barh(range(len(tt)), tt.r2,
+             color=[RENK["oot"] if a <= CONFIG["CHALLENGER_MAX_AY"] else RENK["tr"]
+                    for a in tt.gereken_ay])
+ax[1,0].set_yticks(range(len(tt)))
+ax[1,0].set_yticklabels([f"{c[:26]} ({a}ay)" for c, a in zip(tt.degisken, tt.gereken_ay)],
+                        fontsize=6)
+ax[1,0].set_xlim(0, 1); ax[1,0].set_title("Budanmis havuz r2\nyesil=challenger(<=3ay)")
+
+mx = tek[tek.gereken_ay <= CONFIG["CHALLENGER_MAX_AY"]].iloc[0]["degisken"]
+for b_, g in d.groupby("BOLGE"):
+    if b_ == "TAHMIN": continue
+    ax[1,1].scatter(g[mx], g[HEDEF]*100, s=35, color=bg[b_], label=b_)
+_s = d.loc[tr_idx, [mx, HEDEF]].dropna()
+z_ = np.polyfit(_s[mx], _s[HEDEF]*100, 1)
+xs = np.linspace(d[mx].min(), d[mx].max(), 50)
+ax[1,1].plot(xs, np.polyval(z_, xs), color=RENK["tah"], lw=1.5)
+ax[1,1].set_xlabel(mx[:30]); ax[1,1].set_ylabel("hedef (%)")
+ax[1,1].set_title(f"En guclu challenger girdisi\nr2={tek.set_index('degisken').r2[mx]:.3f} "
+                  f"({GEREKEN_AY[mx]} ay)")
+ax[1,1].legend(fontsize=7)
+
+kk = d.loc[tr_idx, CHALLENGER_BUDANMIS[:12] + [HEDEF]].corr()
+im = ax[1,2].imshow(kk, cmap="RdBu_r", vmin=-1, vmax=1)
+ax[1,2].set_xticks(range(len(kk))); ax[1,2].set_yticks(range(len(kk)))
+lbl = [c.replace("KK_TAKIP_", "").replace("_TUTARSAL", "")[:14] for c in kk.columns]
+ax[1,2].set_xticklabels(lbl, rotation=90, fontsize=5)
+ax[1,2].set_yticklabels(lbl, fontsize=5)
+ax[1,2].set_title("Challenger budanmis korelasyon"); ax[1,2].grid(False)
+plt.colorbar(im, ax=ax[1,2], shrink=.7)
+plt.tight_layout(); plt.show()
+
+print("=" * 102)
+print(f"BLOK 3 TAMAM")
+print(f"  CHAMPION_BUDANMIS   : {len(CHAMPION_BUDANMIS)}")
+print(f"  CHALLENGER_BUDANMIS : {len(CHALLENGER_BUDANMIS)}")
+print(f"  TREND_DENE={CONFIG['TREND_DENE']}  MEVSIM_DENE={CONFIG['MEVSIM_DENE']}")
+print(f"  Varyant: {eski:,} -> {yeni:,}")
+print("=" * 102)
