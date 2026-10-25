@@ -1,160 +1,145 @@
-# ============================================================================
-# BLOK 11 — SAMPIYON DOGRULAMA VE NIHAI KARAR
-#
-# DURUM: CHAMPION v2c skill +0.265 ile esigi gecti. AMA:
-#   - 12 gozlem uzerinde olculdu
-#   - Bu OOT v1'de harcandi
-#   - ULTRA_ERKEN v2b Pearson -0.089 (WMAPE yaniltici)
-#
-# BU BLOK:
-#   11.1  WMAPE + PEARSON birlikte -> dogru secim (WMAPE tek basina yetmez)
-#   11.2  CHAMPION v2c donem bazinda detay
-#   11.3  BOOTSTRAP: skill +0.265'in guven araligi
-#   11.4  DIEBOLD-MARIANO: Dummy'den farki istatistiksel olarak anlamli mi?
-#   11.5  Nihai karar ve uretim cercevesi
-# ============================================================================
-print("=" * 110)
-print("BLOK 11 — SAMPIYON DOGRULAMA")
-print("=" * 110)
+# ============================================================
+# BLOK 12 — RAPORLAMA PAKETİ
+# 12.1 tam metrik tablosu (tüm basamaklar × üç bölge)
+# 12.2 şampiyon modelin formülü ve katsayıları
+# 12.3 gerçekleşen vs tahmin serisi (TRAIN/ARA/OOT) + grafik
+# 12.4 gelecek tahminleri (202510–202603)
+# ============================================================
+import numpy as np, pandas as pd
+from scipy import stats
+import matplotlib.pyplot as plt
 
-# ---------------------------------------------------------------- 11.1
-print("\n" + "-" * 110)
-print("11.1  DOGRU SECIM: WMAPE + PEARSON birlikte")
-print("-" * 110)
-print("""
-  10.D'deki ozet tablo WMAPE.idxmin() ile secim yapti -> YANLIS.
-  ULTRA_ERKEN v2b: WMAPE 13.33 (iyi) ama PEARSON -0.089 (model bilgi tasimiyor).
-  Dusuk WMAPE, "duz cizgi tahmin et" stratejisiyle de elde edilebilir.
+HEDEF = CONFIG.get("HEDEF_KOLON") or [c for c in d.columns if "12M90" in str(c).upper()][0]
 
-  DOGRU KRITER: PEARSON > 0.30 SARTI + sonra WMAPE minimum
-""")
-V2S2 = V2S.copy()
-V2S2["GECERLI"] = V2S2.PEARSON > 0.30
-dogru = []
-for ad in V2S2.MERDIVEN.unique():
-    s = V2S2[(V2S2.MERDIVEN == ad) & V2S2.GECERLI]
-    if len(s) == 0:
-        s = V2S2[V2S2.MERDIVEN == ad]
-        print(f"  !! [{ad}] hicbir senaryo PEARSON>0.30 saglamiyor")
-    b = s.loc[s.WMAPE.idxmin()]
-    dogru.append(b)
-DOGRU = pd.DataFrame(dogru)
-DOGRU["erkenlik"] = DOGRU.MERDIVEN.map(
-    {k: CONFIG["HEDEF_OLGUNLASMA_AY"]-v["bilgi_ay"] for k, v in SECILEN.items()})
-print("\n  PEARSON>0.30 sartiyla DOGRU secim:")
-print(DOGRU[["MERDIVEN","erkenlik","senaryo","WMAPE","SAPMA","POZ","PEARSON","skill"]]
-        .sort_values("erkenlik", ascending=False).round(4).to_string(index=False))
-print(f"\n  Karsilastirma — 10.D'nin (hatali) secimi:")
-print(best[["MERDIVEN","senaryo","WMAPE","PEARSON","skill"]].round(4).to_string(index=False))
+# --- bölge sınırları (BLOK 4'teki değerlerle aynı olmalı) -----------------
+P = lambda s: pd.Period(s, freq="M")
+SINIR = {"TRAIN": (P("2021-01"), P("2024-03")),
+         "ARA":   (P("2024-04"), P("2024-09")),
+         "OOT":   (P("2024-10"), P("2025-09"))}
 
-# ---------------------------------------------------------------- 11.2
-print("\n" + "-" * 110)
-print("11.2  CHAMPION v2c — DONEM BAZINDA")
-print("-" * 110)
-s = SECILEN["CHAMPION"]
-payda = [c for c in V2_HAVUZ if GEREKEN_AY.get(c, 99) <= s["bilgi_ay"]
-         and (c.startswith("KK_TAKIP_") or c.startswith("RR_"))][0]
-print(f"  Oransal payda : {payda.replace('KK_TAKIP_','').replace(f'_{T}','')}")
-print(f"  Egitim penceresi: son 30 kohort  |  Duzeltme penceresi: 6 kohort")
-print(f"  Girdiler: {[c.replace('KK_TAKIP_','').replace(f'_{T}','') for c in s['kolonlar']+s['ek']]}\n")
+def bolge_idx(ad):
+    a, b = SINIR[ad]
+    m = (d["AY"] >= a) & (d["AY"] <= b) & d[HEDEF].notna()
+    return d.index[m]
 
-r_v2c = wf_pencereli(s["kolonlar"], s["aile"], s["bilgi_ay"], oot_idx,
-                     max_gecmis=30, ek_kolonlar=s["ek"], yarilanma=s["yarilanma"],
-                     oran_paydasi=payda, duzelt_pencere=6)
-r_v1  = walkforward(s["kolonlar"], s["aile"], s["bilgi_ay"], oot_idx,
-                    s["yarilanma"], s["ek"])
-r_dum = walkforward([CHALLENGER_BUDANMIS[0]], "Dummy", 3, oot_idx)
+# --- metrik seti ---------------------------------------------------------
+def metrikler(y, yhat, w=None):
+    y, yhat = np.asarray(y, float), np.asarray(yhat, float)
+    ok = np.isfinite(y) & np.isfinite(yhat)
+    y, yhat = y[ok], yhat[ok]
+    w = np.ones(len(y)) if w is None else np.asarray(w, float)[ok]
+    e = yhat - y
+    out = {
+        "N":        len(y),
+        "MAE":      np.mean(np.abs(e)),
+        "MSE":      np.mean(e**2),
+        "RMSE":     np.sqrt(np.mean(e**2)),
+        "MAPE_%":   100*np.mean(np.abs(e)/y),
+        "WMAPE_%":  100*np.sum(w*np.abs(e))/np.sum(w*y),
+        "SAPMA":    np.mean(e),                      # + = fazla tahmin
+        "BIAS_ORANI": abs(np.mean(e))/np.mean(np.abs(e)),
+        "PEARSON":  stats.pearsonr(y, yhat)[0] if len(y) > 2 else np.nan,
+        "SPEARMAN": stats.spearmanr(y, yhat)[0] if len(y) > 2 else np.nan,
+        "ARTI_HATA": int((e > 0).sum()),
+    }
+    out["R2"] = 1 - np.sum(e**2)/np.sum((y-y.mean())**2) if len(y) > 2 else np.nan
+    return out
 
-DET = pd.DataFrame({"DONEM": r_v2c["_don"],
-                    "GERCEK_%": [100*x for x in r_v2c["_ger"]],
-                    "v2c_%":    [100*x for x in r_v2c["_tah"]],
-                    "v1_%":     [100*x for x in r_v1["_tah"]],
-                    "Dummy_%":  [100*x for x in r_dum["_tah"]]})
-for k in ["v2c","v1","Dummy"]:
-    DET[f"{k}_sapma"] = DET[f"{k}_%"] - DET["GERCEK_%"]
-print(DET.round(3).to_string(index=False))
-print(f"\n  v2c   : WMAPE={r_v2c['WMAPE']:.3f}  sapma={r_v2c['SAPMA']:+.5f}  "
-      f"poz={r_v2c['POZ']}/{r_v2c['N']}  Pearson={r_v2c['PEARSON']:.4f}")
-print(f"  v1    : WMAPE={r_v1['WMAPE']:.3f}  sapma={r_v1['SAPMA']:+.5f}  "
-      f"poz={r_v1['POZ_SAPMA']}/{r_v1['N']}")
-print(f"  Dummy : WMAPE={r_dum['WMAPE']:.3f}  sapma={r_dum['SAPMA']:+.5f}  "
-      f"poz={r_dum['POZ_SAPMA']}/{r_dum['N']}")
+# --- 12.1  BASAMAK × BÖLGE TABLOSU --------------------------------------
+# BLOK 11'de seçilen nihai kurulumları buraya yaz (basamak adı -> wf_pencereli argümanları)
+FINAL = {
+  # ÖRNEK — BLOK 11 çıktısındaki gerçek değerlerle değiştir:
+  # "OLGUN_6M": dict(kolonlar=[...], aile="OLGUN", bilgi_ay=6,
+  #                  max_gecmis=30, oran_paydasi="KK_TAKIP_30_2_TUTARSAL",
+  #                  duzelt_pencere=6, ek_kolonlar=["MM_SKOR","AY_SIN","AY_COS"]),
+}
 
-# ---------------------------------------------------------------- 11.3
-print("\n" + "-" * 110)
-print("11.3  BOOTSTRAP — skill +0.265'in guven araligi (12 gozlem!)")
-print("-" * 110)
-rng = np.random.default_rng(42)
-y  = np.array(r_v2c["_ger"]); p2 = np.array(r_v2c["_tah"])
-p1 = np.array(r_v1["_tah"]);  pd_= np.array(r_dum["_tah"])
-B = 5000; sk, dm_fark = np.empty(B), np.empty(B)
-for i in range(B):
-    ix = rng.integers(0, len(y), len(y))
-    w2 = 100*np.sum(np.abs(p2[ix]-y[ix]))/np.sum(np.abs(y[ix]))
-    wd = 100*np.sum(np.abs(pd_[ix]-y[ix]))/np.sum(np.abs(y[ix]))
-    sk[i] = 1 - w2/wd
-    dm_fark[i] = wd - w2
-print(f"  skill ortalama        : {sk.mean():+.4f}")
-print(f"  %90 guven araligi     : [{np.percentile(sk,5):+.4f}, {np.percentile(sk,95):+.4f}]")
-print(f"  %95 guven araligi     : [{np.percentile(sk,2.5):+.4f}, {np.percentile(sk,97.5):+.4f}]")
-print(f"  P(skill > 0)          : {100*(sk>0).mean():.1f}%")
-print(f"  P(skill > 0.15)       : {100*(sk>0.15).mean():.1f}%")
-print(f"\n  >> %90 alt sinir > 0 ise, Dummy'den ustunluk 12 gozlemde bile saglam.")
-print(f"  >> Alt sinir negatifse, +0.265 SANS olabilir — yeni OOT sart.")
+satir = []
+for ad, kw in FINAL.items():
+    for bolge in ["TRAIN", "ARA", "OOT"]:
+        idx = bolge_idx(bolge)
+        res = wf_pencereli(hedef_idx=idx, **kw)
+        r = res if isinstance(res, pd.DataFrame) else pd.DataFrame(res)
+        gy  = d.loc[r.index, HEDEF].values
+        w   = d.loc[r.index, "BASVURU_ADEDI"].values
+        yh  = r.iloc[:, 0].values if "TAHMIN" not in r else r["TAHMIN"].values
+        satir.append({"BASAMAK": ad, "BOLGE": bolge, **metrikler(gy, yh, w)})
 
-# ---------------------------------------------------------------- 11.4
-print("\n" + "-" * 110)
-print("11.4  DIEBOLD-MARIANO — v2c vs Dummy, v2c vs v1")
-print("-" * 110)
-def dm_testi(y, pa, pb, ad_a, ad_b):
-    """H0: iki tahminin dogrulugu esit. Kayip farki uzerinde t-testi."""
-    la = np.abs(pa-y); lb = np.abs(pb-y)
-    dfark = la - lb
-    n = len(dfark); ort = dfark.mean()
-    # HAC varyans (Newey-West, lag=1) — kucuk orneklem icin
-    g0 = np.mean((dfark-ort)**2)
-    g1 = np.mean((dfark[1:]-ort)*(dfark[:-1]-ort)) if n > 2 else 0.0
-    var = (g0 + 2*g1)/n
-    dm = ort/np.sqrt(var) if var > 0 else np.nan
-    p = 2*(1-stats.t.cdf(abs(dm), n-1)) if np.isfinite(dm) else np.nan
-    print(f"  {ad_a} vs {ad_b}:  ort_kayip_farki={ort:+.6f}  DM={dm:+.3f}  p={p:.4f}  "
-          f"{'-> ' + (ad_b if ort>0 else ad_a) + ' DAHA IYI' if p<0.10 else '-> fark anlamsiz'}")
-    return p
-dm_testi(y, pd_, p2, "Dummy", "v2c")
-dm_testi(y, p1,  p2, "v1   ", "v2c")
-print("\n  (DM testi 12 gozlemde dusuk gucludur; p<0.10 esigi kullanildi)")
+TABLO = pd.DataFrame(satir)
+pd.set_option("display.width", 250, "display.max_columns", 30)
+print(TABLO.round(4).to_string(index=False))
+TABLO.to_excel("12_metrik_tablosu.xlsx", index=False)
 
-# ---------------------------------------------------------------- 11.5
-print("\n" + "=" * 110)
-print("11.5  NIHAI KARAR")
-print("=" * 110)
-alt90 = np.percentile(sk, 5)
-print(f"""
-  OLCULEN:
-    CHAMPION v2c  : WMAPE {r_v2c['WMAPE']:.2f}  skill {1-r_v2c['WMAPE']/r_dum['WMAPE']:+.3f}
-                    Pearson {r_v2c['PEARSON']:.3f}  sapma {r_v2c['SAPMA']:+.5f}
-                    skill %90 GA = [{np.percentile(sk,5):+.3f}, {np.percentile(sk,95):+.3f}]
-    Erken basamaklar (1-3 ay): hicbiri Dummy'yi gecemedi
+# --- 12.2  ŞAMPİYONUN KATSAYILARI --------------------------------------
+SAMPIYON = "OLGUN_6M"        # FINAL içindeki şampiyon anahtarı
+kw = FINAL[SAMPIYON]
+kols = list(kw["kolonlar"]) + list(kw.get("ek_kolonlar") or [])
+son_idx = bolge_idx("OOT")                 # en güncel eğitim penceresi
+tr = d.loc[d["AY"] <= SINIR["OOT"][1]].dropna(subset=[HEDEF]).sort_values("AY")
+if kw.get("max_gecmis"): tr = tr.iloc[-kw["max_gecmis"]:]
 
-  YAPISAL BULGU:
-    Oransal model HER basamakta Pearson'u yukseltiyor (siralama iyilesiyor)
-    ama seviyeyi bozuyor. Seviye ancak TAZE ARTIK bilgisiyle geri kazanilabiliyor,
-    o da sadece bilgi_ay >= 4'te mumkun.
-    -> ERKENLIK/GUVENILIRLIK takasinin kritik esigi: 6 AY
+pipe = pipeline_kur(kw["aile"]) if "pipeline_kur" in dir() else None   # BLOK 5'teki kurucu
+X, y = tr[kols], tr[HEDEF]
+payda = kw.get("oran_paydasi")
+if payda: y = y / tr[payda]
+_fit_agirlikli(pipe, X, y, _agirlik(tr.index), kw["aile"])
 
-  URETIM ONERISI:
-    [EVET] CHAMPION v2c (6 ay) -> izlemeli pilot, su sartlarla:
-             - aylik PSI: MM_SKOR, 60_6, 30_2_MA3
-             - aylik sapma izleme: ardisik 3 ay ayni yonlu sapma -> ALARM
-             - 202510+ kohortlari olgunlastikca GERCEK OOT ile dogrula
-             - k-stabilite yeniden olc: k_son/ilk 0.85-1.15 disina cikarsa REKALIBRE
-    [HAYIR] 1-3 ay basamaklari -> uretime alinmaz, arastirma devam
+def katsayilar(pipe, kols):
+    m = pipe
+    for attr in ("regressor_", "named_steps"):
+        if hasattr(m, "regressor_"): m = m.regressor_
+    sc = m.named_steps.get("s"); reg = m.named_steps.get("m")
+    b_std = np.ravel(reg.coef_)
+    b_raw = b_std / sc.scale_ if sc is not None else b_std
+    sabit = float(reg.intercept_) - (np.sum(b_raw * sc.mean_) if sc is not None else 0)
+    return pd.DataFrame({"DEGISKEN": kols, "KATSAYI_STD": b_std,
+                         "KATSAYI_HAM": b_raw}), sabit
 
-  v3 ICIN YON:
-    1. k-stabilite filtresini ORTAK ALANLARA da uygula (MM_SKOR K_SKOR=0.94!)
-    2. Erken basamaklar icin seviye cipasi ARA: makro (faiz, issizlik, TUFE),
-       portfoy kompozisyonu, kampanya/limit politikasi degiskenleri
-    3. OOT penceresini uzat (12 -> 18+) ve YENI bir OOT ayir
-    4. ADETSEL hedefi ayni akista kosup tutarsalla karsilastir
-""")
-print("=" * 110)
+KATS, SABIT = katsayilar(pipe, kols)
+KATS["ETKI_%"] = 100*np.abs(KATS.KATSAYI_STD)/np.abs(KATS.KATSAYI_STD).sum()
+print(KATS.round(6).to_string(index=False)); print("SABIT =", round(SABIT, 6))
+print("\nFORMÜL:\n  tahmin =", round(SABIT, 5), "".join(
+    f"\n           {'+' if b>=0 else '-'} {abs(b):.5f} × {k}"
+    for k, b in zip(KATS.DEGISKEN, KATS.KATSAYI_HAM)))
+if payda: print(f"  (sonuç {payda} ile çarpılır — oransal hedef)")
+if kw.get("duzelt_pencere"): print(f"  (son {kw['duzelt_pencere']} kohortun ortalama sapması düşülür)")
+KATS.to_excel("12_katsayilar.xlsx", index=False)
+
+# --- 12.3  GERÇEKLEŞEN vs TAHMİN SERİSİ --------------------------------
+parcalar = []
+for bolge in ["TRAIN", "ARA", "OOT"]:
+    idx = bolge_idx(bolge)
+    res = wf_pencereli(hedef_idx=idx, **kw)
+    r = res if isinstance(res, pd.DataFrame) else pd.DataFrame(res)
+    yh = r["TAHMIN"].values if "TAHMIN" in r else r.iloc[:, 0].values
+    parcalar.append(pd.DataFrame({
+        "AY": d.loc[r.index, "AY"].astype(str).values, "BOLGE": bolge,
+        "GERCEK": d.loc[r.index, HEDEF].values, "TAHMIN": yh}))
+SERI = pd.concat(parcalar).sort_values("AY")
+SERI["HATA"] = SERI.TAHMIN - SERI.GERCEK
+SERI["HATA_%"] = 100*SERI.HATA/SERI.GERCEK
+print(SERI.round(4).to_string(index=False))
+SERI.to_excel("12_seri.xlsx", index=False)
+
+fig, ax = plt.subplots(figsize=(15, 5))
+ax.plot(SERI.AY, SERI.GERCEK, "o-", lw=2.5, color="#16253D", label="Gerçekleşen")
+ax.plot(SERI.AY, SERI.TAHMIN, "s--", lw=2, color="#C25E00", label="Tahmin")
+for b, c in [("ARA", "#FDF1E3"), ("OOT", "#E7EFEC")]:
+    s = SERI[SERI.BOLGE == b]
+    if len(s): ax.axvspan(s.AY.iloc[0], s.AY.iloc[-1], color=c, zorder=0)
+ax.set_title("12M90 — gerçekleşen vs tahmin (TRAIN / ARA / OOT)")
+ax.legend(); plt.xticks(rotation=90, fontsize=7); plt.tight_layout(); plt.show()
+
+# --- 12.4  GELECEK TAHMİNLERİ (202510–202603) --------------------------
+gelecek = d[d[HEDEF].isna()].sort_values("AY")
+Xg = gelecek[kols]
+yg = pipe.predict(Xg)
+if payda: yg = yg * gelecek[payda].values
+if kw.get("duzelt_pencere"):
+    son = SERI[SERI.BOLGE == "OOT"].tail(kw["duzelt_pencere"])
+    yg = yg - son.HATA.mean()
+GELECEK = pd.DataFrame({"AY": gelecek["AY"].astype(str).values,
+                        "TAHMIN_%": yg,
+                        "OLGUNLUK_AY": [(P("2026-10") - a).n for a in gelecek["AY"]]})
+print(GELECEK.round(4).to_string(index=False))
+GELECEK.to_excel("12_gelecek.xlsx", index=False)
