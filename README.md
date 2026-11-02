@@ -52,9 +52,11 @@ CONFIG = {
     # Aday havuzu ve arama
     "MAX_K": 3,
     "AYNI_AYDAN_TEK_ONCUL": True,
-    "MODEL_AILELERI": ["Linear", "Ridge", "Lasso", "ElasticNet"],
+    "MODEL_AILELERI": ["Linear", "Ridge"],    # v4: Lasso 13,95 / ElasticNet 12,41, hiç birinci olmadı (süre için)
     "TREND_DENE": False,                      # v4'te test edildi: 0 geçerli model (süre için kapalı)
     "HEDEF_BAZLI_HAVUZA": False,              # hedef lag değişkenleri ilk fold'larda boş -> ayrı deneyde (8B)
+    "ROLL_PENCERE": [3, 6],                   # rolling pencereleri (kohort sayısı); örn. [3, 4, 5, 6]
+    "MAX_TURETILMIS": 1,                      # bir modelde en fazla kaç türetilmiş değişken (arama süresi)
     "MEVSIM_DENE": True,
     "TREND_SECILEBILIR": False,               # trend gelecekte doğrusal ekstrapole eder -> seçilemez
     "TREND_ORIJIN": "2021-01",
@@ -79,7 +81,8 @@ CONFIG = {
                         "ElasticNet*", "Huber"],
 
     # Model seçimi
-    "SECIM_MODU": "SABIT",                    # "SABIT" (onaylı champion) | "KURAL" (sadelik kuralı)
+    "SECIM_MODU": "KURAL",                    # "KURAL": champion filtresiz havuzdan | "SABIT": CHAMPION_SABIT
+    "CHALLENGER_MAX_AY": 3,                   # challenger en geç bu aydaki bilgiyi kullanabilir
     "CHAMPION_SABIT": {"girdiler": ["30_2", "KKB_SKOR_O0120"], "aile": "Linear", "mevsim": False},
     "SADELIK_TOLERANSI": 0.03,                # en iyi CV_WMAPE'in %3 yakınındakiler kısa listeye
     "HAC_P_ESIK": 0.10,                       # tüm katsayılar anlamlı olmalı (geliştirme verisinde)
@@ -197,8 +200,10 @@ display(VERI_OZET.style.format({"HEDEF_ORT": yuzde}, na_rep="-"))
 #   - X_Y öncülü, kohort j için ancak j + Y < T ise bilinir (veri, ayın ilk haftasında gelir)
 #   - 90_12 hedefi, kohort j için ancak j + 12 < T ise bilinir
 #   - Sadece geçmişe bakılır: rolling(center=False), shift(k>0). Lead (shift(-k)) YASAK.
-TURETIM_BAZ = ["30_2", "60_3"]              # rolling / diff üretilecek öncüller
-ROLL_PENCERE = [3, 6]
+# Türetme tabanı: TÜM öncüller (_2 … _6) + TÜM başvuru anı metrikleri. (gözlem ayı: öncülde Y, başvuruda 0)
+TURETIM_BAZ = {oncul_kolon(k): oncul_ay(k) for k in ONCU_KODLARI}
+TURETIM_BAZ.update({c: 0 for c in ORTAK_ALANLAR})
+ROLL_PENCERE = CONFIG["ROLL_PENCERE"]
 HEDEF_LAG_B = 2                             # hedef bazlı değişkenlerin en erken bilgi ayı
 HEDEF_LAG = CONFIG["HEDEF_OLGUNLASMA_AY"] - HEDEF_LAG_B + 1   # 11: tahmin anında olgun en yakın kohort
 
@@ -211,11 +216,12 @@ def ozellik_uret(df, T):
     x.loc[x["AY"] + CONFIG["HEDEF_OLGUNLASMA_AY"] >= T, HEDEF] = np.nan   # T'de belli olmayan hedef -> NaN
     hedef_bilinen = x[HEDEF]
     yeni, ay = {}, {}
-    for kod in TURETIM_BAZ:
-        s = x[oncul_kolon(kod)]
-        for w_ in ROLL_PENCERE:                                    # kendisi + önceki w-1 kohort
-            yeni[f"{kod}_ORT{w_}"] = s.rolling(w_, min_periods=1).mean(); ay[f"{kod}_ORT{w_}"] = oncul_ay(kod)
-        yeni[f"{kod}_DEGISIM"] = s.diff(); ay[f"{kod}_DEGISIM"] = oncul_ay(kod)   # kendisi - lag1
+    for kol, Y in TURETIM_BAZ.items():
+        s, ad = x[kol], kisa_ad(kol)
+        for w_ in ROLL_PENCERE:                                    # kendisi + önceki w-1 kohort (center=False)
+            # kendi değeri henüz yoksa türev de yok: değişken, tabanıyla aynı anda kullanılabilir olur
+            yeni[f"{ad}_ORT{w_}"] = s.rolling(w_, min_periods=1).mean().where(s.notna()); ay[f"{ad}_ORT{w_}"] = Y
+        yeni[f"{ad}_DEGISIM"] = s.diff(); ay[f"{ad}_DEGISIM"] = Y  # kendisi - lag1
     h = hedef_bilinen.shift(HEDEF_LAG)                             # lag 11
     yeni["HEDEF_LAG_ORT6"] = h.rolling(6, min_periods=1).mean(); ay["HEDEF_LAG_ORT6"] = HEDEF_LAG_B
     oran = (hedef_bilinen / x[oncul_kolon("30_2")]).shift(HEDEF_LAG)
@@ -264,7 +270,9 @@ bilgi_ayi_hesapla = lambda kolonlar: max([kolon_ayi(c) for c in kolonlar], defau
 
 def kombinasyon_uygun(alt):
     aylar = [kolon_ayi(c) for c in alt if c in ONCULLER]            # kural sadece ham öncüller için
-    return (not CONFIG["AYNI_AYDAN_TEK_ONCUL"]) or len(aylar) == len(set(aylar))
+    if CONFIG["AYNI_AYDAN_TEK_ONCUL"] and len(aylar) != len(set(aylar)):
+        return False
+    return sum(c in TURETILMIS for c in alt) <= CONFIG["MAX_TURETILMIS"]   # model başına türetilmiş sınırı
 
 KOMBS = [a for k in range(1, CONFIG["MAX_K"] + 1) for a in combinations(HAVUZ, k) if kombinasyon_uygun(a)]
 HAVUZ_TABLO = pd.DataFrame({
@@ -556,18 +564,31 @@ def hac_p(kolonlar, df):
 aday = grid[grid["GECERLI"] & grid["SECILEBILIR"]].copy()
 if aday.empty:
     raise ValueError("Seçilebilir geçerli model yok: GECERLI eşiklerini kontrol et.")
-kisa = aday[aday["CV_WMAPE"] <= aday["CV_WMAPE"].min() * (1 + CONFIG["SADELIK_TOLERANSI"])].copy()
-kisa = kisa.drop_duplicates(["KOLONLAR", "MODEL"])
-kisa["PARAMETRE"] = kisa["KOLONLAR"].apply(len)
-kisa["HAC_MAKS_P"] = kisa["KOLONLAR"].apply(lambda k: float(np.max(hac_p(k, cv_df))))
-kisa["ANLAMLI"] = kisa["HAC_MAKS_P"] <= CONFIG["HAC_P_ESIK"]
-kisa["AILE_SIRA"] = kisa["MODEL"].map(AILE_SIRA)
-kisa = kisa.sort_values(["ANLAMLI", "PARAMETRE", "BILGI_AY", "AILE_SIRA", "RANK_SKORU"],
+
+
+def kisa_liste(havuz, baslik):
+    """En iyi CV_WMAPE'nin %tol yakınındakiler; önce anlamlı, sonra sade, erken, basit aile."""
+    k_ = havuz[havuz["CV_WMAPE"] <= havuz["CV_WMAPE"].min() * (1 + CONFIG["SADELIK_TOLERANSI"])].copy()
+    k_ = k_.drop_duplicates(["KOLONLAR", "MODEL"])
+    k_["PARAMETRE"] = k_["KOLONLAR"].apply(len)
+    k_["HAC_MAKS_P"] = k_["KOLONLAR"].apply(lambda k: float(np.max(hac_p(k, cv_df))))
+    k_["ANLAMLI"] = k_["HAC_MAKS_P"] <= CONFIG["HAC_P_ESIK"]
+    k_["AILE_SIRA"] = k_["MODEL"].map(AILE_SIRA)
+    k_ = k_.sort_values(["ANLAMLI", "PARAMETRE", "BILGI_AY", "AILE_SIRA", "RANK_SKORU"],
                         ascending=[False, True, True, True, True]).reset_index(drop=True)
-print(f"=== Sadelik kısa listesi (CV_WMAPE <= en iyi x {1 + CONFIG['SADELIK_TOLERANSI']:.2f}) ===")
-display(kisa[["GIRDILER", "MODEL", "BILGI_AY", "MEVSIM", "PARAMETRE", "CV_WMAPE", "EN_KOTU_WMAPE",
-              "HAC_MAKS_P", "ANLAMLI", "RANK_SKORU"]].style.format(
-    {"CV_WMAPE": "{:.2f}", "EN_KOTU_WMAPE": "{:.2f}", "HAC_MAKS_P": "{:.3f}", "RANK_SKORU": "{:.4f}"}, decimal=","))
+    print(f"=== {baslik}: kısa liste (CV_WMAPE <= en iyi x {1 + CONFIG['SADELIK_TOLERANSI']:.2f}) ===")
+    display(k_[["GIRDILER", "MODEL", "BILGI_AY", "MEVSIM", "PARAMETRE", "CV_WMAPE", "EN_KOTU_WMAPE",
+                "HAC_MAKS_P", "ANLAMLI", "RANK_SKORU"]].head(12).style.format(
+        {"CV_WMAPE": "{:.2f}", "EN_KOTU_WMAPE": "{:.2f}", "HAC_MAKS_P": "{:.3f}", "RANK_SKORU": "{:.4f}"},
+        decimal=","))
+    return k_
+
+
+kisa = kisa_liste(aday, "CHAMPION (filtresiz, tüm aylar)")
+erken = aday[aday["BILGI_AY"] <= CONFIG["CHALLENGER_MAX_AY"]]
+if erken.empty:
+    raise ValueError(f"<= {CONFIG['CHALLENGER_MAX_AY']}. ay bilgisiyle geçerli model yok.")
+kisa_c = kisa_liste(erken, f"CHALLENGER (<= {CONFIG['CHALLENGER_MAX_AY']}. ay)")
 
 
 def spec_yap(satir, rol):
@@ -593,13 +614,25 @@ else:
 if set(KURAL_SATIR["KOLONLAR"]) != set(CHAMP_SATIR["KOLONLAR"]) or KURAL_SATIR["MODEL"] != CHAMP_SATIR["MODEL"]:
     print(f"BİLGİ: sadelik kuralının önerisi farklı -> {KURAL_SATIR['GIRDILER']} | {KURAL_SATIR['MODEL']}")
 
-chal_aday = aday[aday["KOLONLAR"].apply(lambda k: set(taban(k))) != set(taban(CHAMP_SATIR["KOLONLAR"]))]
-CHAL_SATIR = chal_aday.iloc[0]          # en yüksek RANK_SKORU (performans odaklı)
+ayni = lambda r: set(taban(r["KOLONLAR"])) == set(taban(CHAMP_SATIR["KOLONLAR"]))   # aynı değişken seti
+farkli = kisa_c[~kisa_c.apply(ayni, axis=1)]
+if CHAMP_SATIR["BILGI_AY"] <= CONFIG["CHALLENGER_MAX_AY"]:
+    print(f"BİLGİ: champion zaten <= {CONFIG['CHALLENGER_MAX_AY']}. ay bilgisiyle çalışıyor -> sonraki aylar ek "
+          "değer katmıyor; challenger farklı değişken setli en iyi erken model.")
+if len(farkli):
+    CHAL_SATIR = farkli.iloc[0]
+else:
+    yedek = erken[~erken.apply(ayni, axis=1)]
+    if yedek.empty:                                               # geçerli yoksa: seçilebilir en iyi CV
+        g_ = grid[grid["SECILEBILIR"] & (grid["BILGI_AY"] <= CONFIG["CHALLENGER_MAX_AY"])]
+        yedek = g_[~g_.apply(ayni, axis=1)].sort_values("CV_WMAPE")
+        print("UYARI: farklı değişken setli GEÇERLİ erken model yok; challenger eşikleri geçemeyen en iyi aday.")
+    CHAL_SATIR = yedek.iloc[0]
 CHAMP = spec_yap(CHAMP_SATIR, "CHAMPION")
 CHAL = spec_yap(CHAL_SATIR, "CHALLENGER")
 SECIMLER = {"CHAMPION": CHAMP, "CHALLENGER": CHAL}
-print("\n" + CHAMP["ad"] + "   <- sadelik + anlamlılık")
-print(CHAL["ad"] + "   <- en yüksek bileşik skor")
+print("\n" + CHAMP["ad"] + "   <- filtresiz havuz, sadelik + anlamlılık")
+print(CHAL["ad"] + f"   <- <= {CONFIG['CHALLENGER_MAX_AY']}. ay, sadelik + anlamlılık")
 SECIM_TABLO = pd.DataFrame([CHAMP_SATIR, CHAL_SATIR], index=["CHAMPION", "CHALLENGER"])[GOSTER[:-3]]
 display(SECIM_TABLO.style.format(FMT, decimal=","))
 
@@ -755,12 +788,13 @@ from statsmodels.stats.diagnostic import acorr_ljungbox, het_breuschpagan, linea
 from statsmodels.stats.outliers_influence import variance_inflation_factor
 
 kol = CHAMP["kolonlar"]
-Xc = sm.add_constant(olgun_df[kol].astype(float).to_numpy(), has_constant="add")
-yv = olgun_df[HEDEF].astype(float).to_numpy()
+t_df = olgun_df.dropna(subset=kol)
+Xc = sm.add_constant(t_df[kol].astype(float).to_numpy(), has_constant="add")
+yv = t_df[HEDEF].astype(float).to_numpy()
 ols = sm.OLS(yv, Xc).fit()
 lag = int(np.ceil(4 * (len(yv) / 100) ** (2 / 9)))
 hac = sm.OLS(yv, Xc).fit(cov_type="HAC", cov_kwds={"maxlags": lag})
-resid = URETIM["CHAMPION"].predict(olgun_df[kol]) - yv
+resid = URETIM["CHAMPION"].predict(t_df[kol]) - yv
 rho = float(np.corrcoef(resid[:-1], resid[1:])[0, 1])
 jb = jarque_bera(resid)
 TESTLER = pd.DataFrame([
@@ -991,7 +1025,8 @@ print(f"Veri          : {d['AY'].min()} – {d['AY'].max()} ({len(d)} kohort) | 
 for b, r_ in VERI_OZET.iterrows():
     print(f"  {b:<11}: {r_['BAS']} – {r_['SON']} | N={r_['N']} | hedef ort. {yuzde(r_['HEDEF_ORT'])}")
 print(f"Validasyon    : {VAL_BAS} – {cv_df['AY'].max()} ({CONFIG['N_SPLITS']} fold x {CONFIG['TEST_SIZE']} kohort, walk-forward)")
-print(f"Aday havuzu   : {len(HAVUZ)} değişken ({len(ONCULLER)} öncül + {len(ORTAK_ALANLAR)} başvuru) | "
+print(f"Aday havuzu   : {len(HAVUZ)} değişken ({len(ONCULLER)} öncül + {len(ORTAK_ALANLAR)} başvuru + "
+      f"{len(TURETILMIS)} türetilmiş, model başına en fazla {CONFIG['MAX_TURETILMIS']}) | "
       f"{len(KOMBS)} kombinasyon | {len(grid)} varyant | geçerli {int(grid['GECERLI'].sum())}")
 print(f"Model aileleri: {', '.join(sorted(grid['MODEL'].unique()))}")
 print(f"Trend/mevsim  : " + " | ".join(f"{k}: {sayi(v)}" for k, v in OZET_VARYANT["EN_IYI_CV_WMAPE"].items()))
